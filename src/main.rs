@@ -261,7 +261,7 @@ async fn load_special_hashes(state: &AppState) {
         return;
     };
     match conn
-        .smembers::<_, HashSet<String>>("special_hashes")
+        .smembers::<&str, HashSet<String>>("special_hashes")
         .await
     {
         Ok(set) => *state.special_hashes.write().await = set,
@@ -682,7 +682,7 @@ async fn add_special(
 
     if let Some(mut conn) = state.redis_mgr.clone() {
         for h in &hashes {
-            let _: redis::RedisResult<()> = conn.sadd("special_hashes", h).await;
+            let _: redis::RedisResult<()> = conn.sadd::<&str, &str, ()>("special_hashes", h.as_str()).await;
         }
     }
     load_special_hashes(&state).await;

@@ -13,7 +13,7 @@ reqwest = { version = "0.12", features = ["json", "stream"] }
 # Embedded LMDB key-value store (CDN registry)
 heed = "0.20"
 # Redis client (special hashes)
-redis = { version = "0.27", features = ["tokio-comp"] }
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
 # Concurrent hashmap for rate limiter
 dashmap = "6"
 # .env file loader
