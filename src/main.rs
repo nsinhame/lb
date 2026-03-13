@@ -795,7 +795,7 @@ async fn stats(State(state): State<AppState>, headers: HeaderMap) -> Response {
         v.sort();
         v
     };
-    let best = state.best_cdn.read().await.url.clone();
+    let best = get_best_cdn(&state).await;
     let specials: Vec<String> = state.special_hashes.read().await.iter().cloned().collect();
 
     Json(json!({
