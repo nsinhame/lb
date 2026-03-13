@@ -1,0 +1,40 @@
+[package]
+name = "loadbalancer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Async HTTP server framework
+axum = "0.7"
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+# Async HTTP client (for CDN health checks, Arolinks, streaming proxy)
+reqwest = { version = "0.12", features = ["json", "stream"] }
+# Embedded LMDB key-value store (CDN registry)
+heed = "0.20"
+# Redis client (special hashes)
+redis = { version = "0.27", features = ["tokio-comp"] }
+# Concurrent hashmap for rate limiter
+dashmap = "6"
+# .env file loader
+dotenvy = "0.15"
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Regex for HTML rewriting
+regex = "1"
+# URL parsing
+url = "2"
+# Structured logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Random CDN selection
+rand = "0.8"
+# Ergonomic error handling in main()
+anyhow = "1"
+
+[profile.release]
+opt-level = 3
+lto = true          # Link-time optimisation (smaller, faster binary)
+codegen-units = 1   # Single codegen unit for best optimisation
+strip = true        # Strip debug symbols from the binary (~5 MB final size)

@@ -1,0 +1,9 @@
+httpx
+redis
+lmdb
+uvicorn
+gunicorn
+flask
+requests
+python-dotenv
+fastapi
