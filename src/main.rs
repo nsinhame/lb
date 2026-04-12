@@ -149,7 +149,7 @@ struct AppState {
     lmdb_env: Arc<Env>,
     lmdb_db: CdnDb,
     /// None when REDIS_URL is not set
-    redis_mgr: Option<fred::clients::RedisClient>,
+    redis_mgr: Option<RedisClient>,
     special_hashes: Arc<RwLock<HashSet<String>>>,
     best_cdn: Arc<RwLock<BestCdnCache>>,
     /// key = "ip:hash", value = list of request timestamps
@@ -843,9 +843,10 @@ async fn main() -> anyhow::Result<()> {
 
     // ── Redis ──────────────────────────────────────────────────
     let redis_mgr = if let Ok(url) = std::env::var("REDIS_URL") {
-        let config = fred::types::RedisConfig::from_url(&url)?;
-        let client = fred::clients::RedisClient::new(config, None, None, None);
-        // Connect in background; wait until the connection is established
+        // fred v9: use Config (renamed from RedisConfig) + Builder
+        let config = Config::from_url(&url)?;
+        let client = Builder::from_config(config).build()?;
+        // init() drives the connection; TLS is auto-detected from rediss:// URL
         client.init().await?;
         Some(client)
     } else {
