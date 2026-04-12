@@ -12,8 +12,8 @@ tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
 # Embedded LMDB key-value store (CDN registry)
 heed = "0.20"
-# Redis client (special hashes)
-redis = { version = "0.26", features = ["tokio-comp", "connection-manager", "tls-native-tls"] }
+# Redis client (special hashes) – fred has reliable native-TLS for rediss:// URLs
+fred = { version = "9", features = ["native-tls"] }
 # Concurrent hashmap for rate limiter
 dashmap = "6"
 # .env file loader

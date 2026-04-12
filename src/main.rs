@@ -26,7 +26,7 @@ use dashmap::DashMap;
 use dotenvy::dotenv;
 use heed::{Database, Env, EnvOpenOptions};
 use rand::seq::SliceRandom;
-use redis::{aio::ConnectionManager, AsyncCommands};
+use fred::prelude::*;
 use regex::Regex;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -149,7 +149,7 @@ struct AppState {
     lmdb_env: Arc<Env>,
     lmdb_db: CdnDb,
     /// None when REDIS_URL is not set
-    redis_mgr: Option<ConnectionManager>,
+    redis_mgr: Option<fred::clients::RedisClient>,
     special_hashes: Arc<RwLock<HashSet<String>>>,
     best_cdn: Arc<RwLock<BestCdnCache>>,
     /// key = "ip:hash", value = list of request timestamps
@@ -256,14 +256,11 @@ async fn rebuild_trusted_hosts(state: &AppState) {
 // ============================================================
 
 async fn load_special_hashes(state: &AppState) {
-    let Some(mut conn) = state.redis_mgr.clone() else {
+    let Some(client) = state.redis_mgr.clone() else {
         *state.special_hashes.write().await = HashSet::new();
         return;
     };
-    match conn
-        .smembers::<&str, HashSet<String>>("special_hashes")
-        .await
-    {
+    match client.smembers::<HashSet<String>, _>("special_hashes").await {
         Ok(set) => *state.special_hashes.write().await = set,
         Err(e) => debug!("Redis error loading special hashes: {}", e),
     }
@@ -680,9 +677,9 @@ async fn add_special(
         })
         .unwrap_or_default();
 
-    if let Some(mut conn) = state.redis_mgr.clone() {
+    if let Some(client) = state.redis_mgr.clone() {
         for h in &hashes {
-            let _: redis::RedisResult<()> = conn.sadd::<&str, &str, ()>("special_hashes", h.as_str()).await;
+            let _: Result<i64, _> = client.sadd("special_hashes", h.as_str()).await;
         }
     }
     load_special_hashes(&state).await;
@@ -846,9 +843,11 @@ async fn main() -> anyhow::Result<()> {
 
     // ── Redis ──────────────────────────────────────────────────
     let redis_mgr = if let Ok(url) = std::env::var("REDIS_URL") {
-        let client = redis::Client::open(url)?;
-        // ConnectionManager auto-reconnects and is cheaply cloneable
-        Some(ConnectionManager::new(client).await?)
+        let config = fred::types::RedisConfig::from_url(&url)?;
+        let client = fred::clients::RedisClient::new(config, None, None, None);
+        // Connect in background; wait until the connection is established
+        client.init().await?;
+        Some(client)
     } else {
         None
     };
