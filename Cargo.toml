@@ -13,7 +13,7 @@ reqwest = { version = "0.12", features = ["json", "stream"] }
 # Embedded LMDB key-value store (CDN registry)
 heed = "0.20"
 # Redis client (special hashes) – fred has reliable native-TLS for rediss:// URLs
-fred = { version = "9", features = ["native-tls"] }
+fred = { version = "9", features = ["enable-native-tls"] }
 # Concurrent hashmap for rate limiter
 dashmap = "6"
 # .env file loader
