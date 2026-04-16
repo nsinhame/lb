@@ -843,8 +843,8 @@ async fn main() -> anyhow::Result<()> {
 
     // ── Redis ──────────────────────────────────────────────────
     let redis_mgr = if let Ok(url) = std::env::var("REDIS_URL") {
-        // fred v9: use Config (renamed from RedisConfig) + Builder
-        let config = fred::types::Config::from_url(&url)?;
+        // fred v9: RedisConfig::from_url (Config alias was removed in v9)
+        let config = RedisConfig::from_url(&url)?;
         let client = Builder::from_config(config).build()?;
         // init() drives the connection; TLS is auto-detected from rediss:// URL
         client.init().await?;
