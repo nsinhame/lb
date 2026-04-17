@@ -541,6 +541,14 @@ async fn poller_task(state: AppState) {
         }
 
         rebuild_trusted_hosts(&state).await;
+
+        // Invalidate best-CDN cache so next request re-evaluates with fresh loads
+        {
+            let mut cache = state.best_cdn.write().await;
+            cache.url = None;
+            cache.updated = Instant::now() - Duration::from_secs(9999);
+        }
+
         tokio::time::sleep(interval).await;
     }
 }
@@ -656,6 +664,47 @@ async fn add_cdn(
         }
     }
     rebuild_trusted_hosts(&state).await;
+
+    // Immediately poll newly added CDNs so they become available within seconds
+    if !added.is_empty() {
+        let s = state.clone();
+        let urls_to_probe = added.clone();
+        tokio::spawn(async move {
+            let mut handles = Vec::with_capacity(urls_to_probe.len());
+            for url in &urls_to_probe {
+                let client = s.http_client.clone();
+                let url = url.clone();
+                handles.push(tokio::spawn(check_cdn_health(client, url)));
+            }
+            for handle in handles {
+                let Ok((url, ok, load)) = handle.await else {
+                    continue;
+                };
+                if ok {
+                    lmdb_set_cdn(
+                        &s,
+                        url.clone(),
+                        CdnMeta {
+                            load,
+                            last_ok: 1,
+                            fail_count: 0,
+                            updated_at: now_unix(),
+                            ts: 0,
+                        },
+                    )
+                    .await;
+                    tracing::info!("CDN {} is online (load={})", url, load);
+                } else {
+                    tracing::warn!("CDN {} did not respond to initial health check", url);
+                }
+            }
+            // Invalidate cache so next request picks up the new CDN immediately
+            let mut cache = s.best_cdn.write().await;
+            cache.url = None;
+            cache.updated = Instant::now() - Duration::from_secs(9999);
+        });
+    }
+
     Json(json!({"added": added})).into_response()
 }
 
@@ -913,12 +962,15 @@ async fn main() -> anyhow::Result<()> {
     // On Koyeb, only the instance whose ID ends in "0" is the leader.
     // Locally (no KOYEB_INSTANCE_ID set) the poller does NOT start;
     // set IS_LEADER=1 in your .env to force it on.
+    // Leader logic: on Koyeb only the instance whose ID ends in "0" polls.
+    // Everywhere else (local dev, Docker, Render, Fly.io) the poller always runs
+    // unless IS_LEADER=0 is set explicitly to disable it.
     let is_leader = std::env::var("KOYEB_INSTANCE_ID")
         .map(|id| id.ends_with('0'))
         .unwrap_or_else(|_| {
             std::env::var("IS_LEADER")
-                .map(|v| v == "1")
-                .unwrap_or(false)
+                .map(|v| v != "0")
+                .unwrap_or(true)
         });
 
     if is_leader {
