@@ -292,13 +292,18 @@ async fn load_special_hashes(state: &AppState) {
                         match cursor.advance().await {
                             Ok(true) => {
                                 if let Ok(doc) = cursor.deserialize_current() {
-                                    // Each document must have _id (hash) and special_type
-                                    if let (Ok(id), Ok(stype)) = (
-                                        doc.get_str("_id"),
-                                        doc.get_str("special_type"),
-                                    ) {
+                                    // _id may be an ObjectId OR a plain string – handle both
+                                    let id_str = doc
+                                        .get_object_id("_id")
+                                        .map(|oid| oid.to_hex())
+                                        .or_else(|_| {
+                                            doc.get_str("_id").map(|s| s.to_string())
+                                        });
+                                    if let (Ok(id), Ok(stype)) =
+                                        (id_str, doc.get_str("special_type"))
+                                    {
                                         state.special_hashes
-                                            .insert(id.to_string(), stype.to_string());
+                                            .insert(id, stype.to_string());
                                     }
                                 }
                             }
