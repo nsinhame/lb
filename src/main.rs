@@ -19,7 +19,7 @@ use axum::{
     body::Body,
     extract::{ConnectInfo, Path, State},
     http::{header, HeaderMap, StatusCode},
-    response::{IntoResponse, Json, Response},
+    response::{Html, IntoResponse, Json, Response},
     routing::{get, post},
     Router,
 };
@@ -520,9 +520,216 @@ async fn handle_special_redirect(state: &AppState, special_type: &str) -> Respon
     }
 }
 
-// ============================================================
-// HTML REWRITING  (fix missing filename in /dl/<hash> URLs)
-// ============================================================
+async fn nitai() -> impl IntoResponse {
+    let html = r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Nitai – Load Balancer Dashboard</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:'Segoe UI',system-ui,sans-serif;background:#0f1117;color:#e2e8f0;min-height:100vh}
+  header{background:linear-gradient(135deg,#1a1f2e,#252d3d);padding:20px 32px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #2d3748}
+  header h1{font-size:1.6rem;font-weight:700;color:#63b3ed;letter-spacing:.5px}
+  header h1 span{color:#68d391}
+  #status-bar{font-size:.8rem;color:#718096;display:flex;align-items:center;gap:8px}
+  #dot{width:8px;height:8px;border-radius:50%;background:#68d391;animation:pulse 2s infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+  main{padding:24px 32px;display:grid;gap:20px}
+  .row{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px}
+  .card{background:#1a1f2e;border:1px solid #2d3748;border-radius:12px;padding:20px}
+  .card h2{font-size:.75rem;text-transform:uppercase;letter-spacing:1px;color:#718096;margin-bottom:12px}
+  .stat-val{font-size:2rem;font-weight:700;color:#63b3ed}
+  .stat-sub{font-size:.78rem;color:#718096;margin-top:4px}
+  #best-cdn-val{font-size:1rem;word-break:break-all;color:#68d391;margin-top:6px;font-weight:600}
+  table{width:100%;border-collapse:collapse;font-size:.85rem}
+  th{text-align:left;padding:10px 12px;color:#718096;font-weight:600;font-size:.75rem;text-transform:uppercase;letter-spacing:.8px;border-bottom:1px solid #2d3748}
+  td{padding:10px 12px;border-bottom:1px solid #1e2535;vertical-align:middle}
+  tr:last-child td{border-bottom:none}
+  tr:hover td{background:#252d3d}
+  .badge{display:inline-block;padding:2px 10px;border-radius:20px;font-size:.72rem;font-weight:600}
+  .online{background:#1c4532;color:#68d391}
+  .offline{background:#742a2a;color:#fc8181}
+  .load-bar-wrap{background:#2d3748;border-radius:4px;height:8px;width:120px;overflow:hidden}
+  .load-bar{height:100%;border-radius:4px;background:linear-gradient(90deg,#63b3ed,#4299e1);transition:width .4s}
+  .load-bar.warn{background:linear-gradient(90deg,#f6ad55,#ed8936)}
+  .load-bar.danger{background:linear-gradient(90deg,#fc8181,#e53e3e)}
+  .hash-chip{background:#2d3748;border-radius:6px;padding:3px 8px;font-size:.75rem;font-family:monospace;color:#e2e8f0;margin:2px;display:inline-block}
+  .stype{font-size:.7rem;padding:1px 6px;border-radius:10px;background:#2c5282;color:#90cdf4;margin-left:4px}
+  #refresh-bar{height:3px;background:#2d3748;border-radius:2px;overflow:hidden;margin-bottom:20px}
+  #refresh-progress{height:100%;background:#63b3ed;transition:width linear}
+  .section-title{font-size:.95rem;font-weight:600;color:#a0aec0;margin-bottom:10px}
+  .empty{color:#4a5568;font-style:italic;font-size:.85rem;padding:12px 0}
+  .trusted-list{display:flex;flex-wrap:wrap;gap:6px;margin-top:4px}
+  .trusted-chip{background:#1a365d;color:#90cdf4;border-radius:6px;padding:3px 10px;font-size:.78rem;font-family:monospace}
+  @media(max-width:600px){main{padding:16px};header{padding:16px}}
+</style>
+</head>
+<body>
+<header>
+  <h1>⚡ Nitai <span>Dashboard</span></h1>
+  <div id="status-bar"><div id="dot"></div><span id="last-update">Loading…</span></div>
+</header>
+<main>
+  <div id="refresh-bar"><div id="refresh-progress" style="width:0%"></div></div>
+
+  <div class="row" id="summary-cards">
+    <div class="card"><h2>Total CDNs</h2><div class="stat-val" id="total-cdns">–</div><div class="stat-sub">registered</div></div>
+    <div class="card"><h2>Online CDNs</h2><div class="stat-val" id="online-cdns" style="color:#68d391">–</div><div class="stat-sub">responding</div></div>
+    <div class="card"><h2>Offline CDNs</h2><div class="stat-val" id="offline-cdns" style="color:#fc8181">–</div><div class="stat-sub">unreachable</div></div>
+    <div class="card"><h2>Total Load</h2><div class="stat-val" id="total-load">–</div><div class="stat-sub">active connections</div></div>
+    <div class="card"><h2>Special Hashes</h2><div class="stat-val" id="special-count">–</div><div class="stat-sub">in DB</div></div>
+    <div class="card"><h2>Best CDN</h2><div id="best-cdn-val">–</div><div class="stat-sub">current selection</div></div>
+  </div>
+
+  <div class="card">
+    <div class="section-title">CDN Registry</div>
+    <table>
+      <thead><tr><th>URL</th><th>Status</th><th>Load</th><th>Load Bar</th><th>Fail Count</th><th>Last Updated</th></tr></thead>
+      <tbody id="cdn-table-body"><tr><td colspan="6" class="empty">Loading…</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="row">
+    <div class="card">
+      <div class="section-title">Special Hashes</div>
+      <div id="special-list"><span class="empty">Loading…</span></div>
+    </div>
+    <div class="card">
+      <div class="section-title">Trusted Hosts</div>
+      <div class="trusted-list" id="trusted-list"></div>
+    </div>
+  </div>
+</main>
+
+<script>
+const REFRESH_MS = 5000;
+let timer, startTime;
+
+function fmtTime(ts) {
+  if (!ts) return '—';
+  const d = new Date(ts * 1000);
+  return d.toLocaleTimeString();
+}
+
+function loadColor(load) {
+  if (load >= 99999) return 'danger';
+  if (load > 20) return 'warn';
+  return '';
+}
+
+function loadBarWidth(load) {
+  if (load >= 99999) return 100;
+  return Math.min(100, Math.round((load / 50) * 100));
+}
+
+async function fetchStats() {
+  try {
+    const r = await fetch('/stats');
+    if (!r.ok) throw new Error(r.status);
+    return await r.json();
+  } catch(e) {
+    return null;
+  }
+}
+
+function render(data) {
+  if (!data) {
+    document.getElementById('last-update').textContent = 'Error – retrying…';
+    document.getElementById('dot').style.background = '#fc8181';
+    return;
+  }
+  document.getElementById('dot').style.background = '#68d391';
+  document.getElementById('last-update').textContent = 'Updated ' + new Date().toLocaleTimeString();
+
+  const cdns = data.cdns || [];
+  const online = cdns.filter(c => c.last_ok === 1);
+  const offline = cdns.filter(c => c.last_ok !== 1);
+  const totalLoad = online.reduce((s, c) => s + (c.load < 99999 ? c.load : 0), 0);
+
+  document.getElementById('total-cdns').textContent = cdns.length;
+  document.getElementById('online-cdns').textContent = online.length;
+  document.getElementById('offline-cdns').textContent = offline.length;
+  document.getElementById('total-load').textContent = totalLoad;
+  document.getElementById('special-count').textContent = (data.special_hashes || []).length;
+
+  const best = data.best_cdn;
+  const bestEl = document.getElementById('best-cdn-val');
+  if (best) {
+    const host = (() => { try { return new URL(best).hostname; } catch(e) { return best; }})();
+    bestEl.textContent = host;
+    bestEl.title = best;
+  } else {
+    bestEl.textContent = 'None';
+    bestEl.style.color = '#fc8181';
+  }
+
+  // CDN table
+  const tbody = document.getElementById('cdn-table-body');
+  if (cdns.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="6" class="empty">No CDNs registered</td></tr>';
+  } else {
+    tbody.innerHTML = cdns.map(c => {
+      const host = (() => { try { return new URL(c.url).hostname; } catch(e) { return c.url; }})();
+      const lc = loadColor(c.load);
+      const bw = loadBarWidth(c.load);
+      const loadDisp = c.load >= 99999 ? '∞' : c.load;
+      return `<tr>
+        <td title="${c.url}" style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${host}</td>
+        <td><span class="badge ${c.last_ok === 1 ? 'online' : 'offline'}">${c.last_ok === 1 ? 'Online' : 'Offline'}</span></td>
+        <td>${loadDisp}</td>
+        <td><div class="load-bar-wrap"><div class="load-bar ${lc}" style="width:${bw}%"></div></div></td>
+        <td>${c.fail_count}</td>
+        <td>${fmtTime(c.updated_at)}</td>
+      </tr>`;
+    }).join('');
+  }
+
+  // Special hashes
+  const specials = data.special_hashes || [];
+  const spEl = document.getElementById('special-list');
+  if (specials.length === 0) {
+    spEl.innerHTML = '<span class="empty">No special hashes</span>';
+  } else {
+    spEl.innerHTML = specials.map(s =>
+      `<span class="hash-chip">${s.hash.slice(0,16)}…<span class="stype">${s.special_type}</span></span>`
+    ).join('');
+  }
+
+  // Trusted hosts
+  const trusted = data.trusted_hosts || [];
+  document.getElementById('trusted-list').innerHTML =
+    trusted.map(h => `<span class="trusted-chip">${h}</span>`).join('');
+}
+
+function startProgress() {
+  const bar = document.getElementById('refresh-progress');
+  startTime = Date.now();
+  clearInterval(timer);
+  timer = setInterval(() => {
+    const elapsed = Date.now() - startTime;
+    const pct = Math.min(100, (elapsed / REFRESH_MS) * 100);
+    bar.style.width = pct + '%';
+    bar.style.transitionDuration = '0ms';
+  }, 50);
+}
+
+async function refresh() {
+  startProgress();
+  const data = await fetchStats();
+  render(data);
+  setTimeout(refresh, REFRESH_MS);
+}
+
+refresh();
+</script>
+</body>
+</html>"#;
+    axum::response::Html(html)
+}
+
+
 
 fn fix_video_src(html: &str, hash: &str, filename: &str) -> String {
     let escaped = regex::escape(hash);
@@ -1122,6 +1329,7 @@ async fn main() -> anyhow::Result<()> {
     // ── Router ─────────────────────────────────────────────────
     let app = Router::new()
         .route("/health", get(health))
+        .route("/nitai", get(nitai))
         .route("/add_cdn", post(add_cdn))
         .route("/add_special", post(add_special))
         .route("/dl/:hash/*filename", get(dl))
