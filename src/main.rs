@@ -624,9 +624,11 @@ function loadBarWidth(load) {
   return Math.min(100, Math.round((load / 50) * 100));
 }
 
+const ADMIN_KEY = new URLSearchParams(location.search).get('key') || '';
+
 async function fetchStats() {
   try {
-    const r = await fetch('/stats');
+    const r = await fetch('/stats', { headers: { 'x-admin-key': ADMIN_KEY } });
     if (!r.ok) throw new Error(r.status);
     return await r.json();
   } catch(e) {
