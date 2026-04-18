@@ -726,7 +726,7 @@ refresh();
 </script>
 </body>
 </html>"#;
-    axum::response::Html(html)
+    Html(html)
 }
 
 
