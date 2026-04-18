@@ -17,7 +17,7 @@ use std::{
 
 use axum::{
     body::Body,
-    extract::{ConnectInfo, OriginalUri, Path, State},
+    extract::{ConnectInfo, Path, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Json, Response},
     routing::{get, post},
@@ -436,15 +436,6 @@ fn check_admin(headers: &HeaderMap, config: &Config) -> Result<(), Response> {
 // AD-REDIRECT / AROLINKS
 // ============================================================
 
-/// Returns `host/path?query` – the scheme-less clicked URL sent to Arolinks.
-fn get_clicked_url(headers: &HeaderMap, uri: &str) -> String {
-    let host = headers
-        .get("host")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    format!("{}{}", host, uri)
-}
-
 async fn arolinks_shorten(
     client: &Client,
     api: &str,
@@ -466,21 +457,67 @@ async fn arolinks_shorten(
     }
 }
 
-async fn redirect_via_ads_or_bot(state: &AppState, headers: &HeaderMap, uri: &str) -> Response {
-    let raw_url = get_clicked_url(headers, uri);
-    if let Some(api) = &state.config.arolinks_api {
-        if let Some(short) = arolinks_shorten(
-            &state.http_client,
-            api,
-            &state.config.arolinks_endpoint,
-            &raw_url,
-        )
-        .await
-        {
-            return axum::response::Redirect::to(&short).into_response();
+// ============================================================
+// SPECIAL-TYPE REDIRECT  (zero_ad / one_ad / two_ad)
+// ============================================================
+
+async fn handle_special_redirect(state: &AppState, special_type: &str) -> Response {
+    let tg = state.config.tg_redirect.clone();
+
+    match special_type {
+        // zero_ad: skip all ads, go straight to the Telegram bot
+        "zero_ad" => axum::response::Redirect::to(&tg).into_response(),
+
+        // one_ad: one Arolinks ad whose destination is the Telegram bot
+        "one_ad" => {
+            if let Some(api) = &state.config.arolinks_api {
+                if let Some(short) = arolinks_shorten(
+                    &state.http_client,
+                    api,
+                    &state.config.arolinks_endpoint,
+                    &tg,
+                )
+                .await
+                {
+                    return axum::response::Redirect::to(&short).into_response();
+                }
+            }
+            axum::response::Redirect::to(&tg).into_response()
         }
+
+        // two_ad: two chained Arolinks ads; second ad leads to Telegram bot
+        "two_ad" => {
+            if let Some(api) = &state.config.arolinks_api {
+                // Step 1: shorten the Telegram bot URL  (this becomes ad #2's destination)
+                if let Some(short2) = arolinks_shorten(
+                    &state.http_client,
+                    api,
+                    &state.config.arolinks_endpoint,
+                    &tg,
+                )
+                .await
+                {
+                    // Step 2: shorten short2 (this becomes ad #1's destination)
+                    if let Some(short1) = arolinks_shorten(
+                        &state.http_client,
+                        api,
+                        &state.config.arolinks_endpoint,
+                        &short2,
+                    )
+                    .await
+                    {
+                        return axum::response::Redirect::to(&short1).into_response();
+                    }
+                    // If second shorten fails, degrade gracefully to one ad
+                    return axum::response::Redirect::to(&short2).into_response();
+                }
+            }
+            axum::response::Redirect::to(&tg).into_response()
+        }
+
+        // Unknown / future types: fall back to bot
+        _ => axum::response::Redirect::to(&tg).into_response(),
     }
-    axum::response::Redirect::to(&state.config.tg_redirect).into_response()
 }
 
 // ============================================================
@@ -812,16 +849,17 @@ async fn dl(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Path(HashFilePath { hash, filename }): Path<HashFilePath>,
-    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
 ) -> Response {
     let ip = addr.ip().to_string();
-    // Look up special_type; any value means this hash is "special"
     let special_type = state.special_hashes.get(&hash).map(|v| v.clone());
 
-    if referer_blocked(&state, &headers, &ip).await || special_type.is_some() {
-        // Currently all special_type values redirect to arolinks ads; extend here later
-        return redirect_via_ads_or_bot(&state, &headers, &uri.to_string()).await;
+    if let Some(ref stype) = special_type {
+        return handle_special_redirect(&state, stype).await;
+    }
+
+    if referer_blocked(&state, &headers, &ip).await {
+        return handle_special_redirect(&state, "one_ad").await;
     }
 
     if record_ip(&state, &ip, &hash) > state.config.max_requests_per_ip {
@@ -855,16 +893,17 @@ async fn watch(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Path(HashFilePath { hash, filename }): Path<HashFilePath>,
-    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
 ) -> Response {
     let ip = addr.ip().to_string();
-    // Look up special_type; any value means this hash is "special"
     let special_type = state.special_hashes.get(&hash).map(|v| v.clone());
 
-    if referer_blocked(&state, &headers, &ip).await || special_type.is_some() {
-        // Currently all special_type values redirect to arolinks ads; extend here later
-        return redirect_via_ads_or_bot(&state, &headers, &uri.to_string()).await;
+    if let Some(ref stype) = special_type {
+        return handle_special_redirect(&state, stype).await;
+    }
+
+    if referer_blocked(&state, &headers, &ip).await {
+        return handle_special_redirect(&state, "one_ad").await;
     }
 
     if record_ip(&state, &ip, &hash) > state.config.max_requests_per_ip {
