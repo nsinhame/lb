@@ -3,7 +3,8 @@
 //! Stack:
 //!   axum 0.7  – HTTP server
 //!   heed 0.20 – embedded LMDB for CDN registry
-//!   redis     – special-hash store
+//!   redis     – special-hash store (optional, set REDIS_URL)
+//!   mongodb   – special-hash store (optional, set MONGO_URL; takes priority over Redis)
 //!   reqwest   – outbound HTTP (health checks, Arolinks, streaming proxy)
 //!   dashmap   – lock-free concurrent rate-limiter map
 
@@ -27,6 +28,7 @@ use dotenvy::dotenv;
 use heed::{Database, Env, EnvOpenOptions};
 use rand::seq::SliceRandom;
 use fred::prelude::*;
+use mongodb::bson::doc;
 use regex::Regex;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -141,6 +143,16 @@ impl Default for BestCdnCache {
 }
 
 // ============================================================
+// HASH STORE  (Redis or MongoDB – holds the special-hashes set)
+// ============================================================
+
+#[derive(Clone)]
+enum HashStoreClient {
+    Redis(RedisClient),
+    Mongo(mongodb::Collection<mongodb::bson::Document>),
+}
+
+// ============================================================
 // SHARED APPLICATION STATE  (cheap to Clone – everything is Arc-backed)
 // ============================================================
 
@@ -148,9 +160,10 @@ impl Default for BestCdnCache {
 struct AppState {
     lmdb_env: Arc<Env>,
     lmdb_db: CdnDb,
-    /// None when REDIS_URL is not set
-    redis_mgr: Option<RedisClient>,
-    special_hashes: Arc<RwLock<HashSet<String>>>,
+    /// None when neither REDIS_URL nor MONGO_URL is set
+    hash_store: Option<HashStoreClient>,
+    /// key = file hash, value = special_type string (e.g. "default", "vip", …)
+    special_hashes: Arc<DashMap<String, String>>,
     best_cdn: Arc<RwLock<BestCdnCache>>,
     /// key = "ip:hash", value = list of request timestamps
     rate_limiter: Arc<DashMap<String, Vec<Instant>>>,
@@ -252,17 +265,50 @@ async fn rebuild_trusted_hosts(state: &AppState) {
 }
 
 // ============================================================
-// REDIS – SPECIAL HASHES
+// HASH STORE – SPECIAL HASHES  (Redis or MongoDB)
 // ============================================================
 
 async fn load_special_hashes(state: &AppState) {
-    let Some(client) = state.redis_mgr.clone() else {
-        *state.special_hashes.write().await = HashSet::new();
-        return;
-    };
-    match client.smembers::<HashSet<String>, _>("special_hashes").await {
-        Ok(set) => *state.special_hashes.write().await = set,
-        Err(e) => debug!("Redis error loading special hashes: {}", e),
+    match &state.hash_store {
+        None => {
+            state.special_hashes.clear();
+        }
+        Some(HashStoreClient::Redis(client)) => {
+            match client.smembers::<HashSet<String>, _>("special_hashes").await {
+                Ok(set) => {
+                    state.special_hashes.clear();
+                    for h in set {
+                        state.special_hashes.insert(h, "default".to_string());
+                    }
+                }
+                Err(e) => debug!("Redis error loading special hashes: {}", e),
+            }
+        }
+        Some(HashStoreClient::Mongo(col)) => {
+            match col.find(None, None).await {
+                Ok(mut cursor) => {
+                    state.special_hashes.clear();
+                    loop {
+                        match cursor.advance().await {
+                            Ok(true) => {
+                                if let Ok(doc) = cursor.deserialize_current() {
+                                    // Each document must have _id (hash) and special_type
+                                    if let (Ok(id), Ok(stype)) = (
+                                        doc.get_str("_id"),
+                                        doc.get_str("special_type"),
+                                    ) {
+                                        state.special_hashes
+                                            .insert(id.to_string(), stype.to_string());
+                                    }
+                                }
+                            }
+                            _ => break,
+                        }
+                    }
+                }
+                Err(e) => debug!("MongoDB error loading special hashes: {}", e),
+            }
+        }
     }
 }
 
@@ -726,13 +772,35 @@ async fn add_special(
         })
         .unwrap_or_default();
 
-    if let Some(client) = state.redis_mgr.clone() {
-        for h in &hashes {
-            let _: Result<i64, _> = client.sadd("special_hashes", h.as_str()).await;
+    // special_type defaults to "default" if not provided
+    let special_type = body
+        .get("special_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("default")
+        .to_string();
+
+    match &state.hash_store {
+        Some(HashStoreClient::Redis(client)) => {
+            for h in &hashes {
+                let _: Result<i64, _> = client.sadd("special_hashes", h.as_str()).await;
+            }
         }
+        Some(HashStoreClient::Mongo(col)) => {
+            if !hashes.is_empty() {
+                for h in &hashes {
+                    let filter = doc! { "_id": h };
+                    let update = doc! { "$set": { "_id": h, "special_type": &special_type } };
+                    let opts = mongodb::options::UpdateOptions::builder()
+                        .upsert(true)
+                        .build();
+                    let _ = col.update_one(filter, update, opts).await;
+                }
+            }
+        }
+        None => {}
     }
     load_special_hashes(&state).await;
-    Json(json!({"added": hashes})).into_response()
+    Json(json!({"added": hashes, "special_type": special_type})).into_response()
 }
 
 async fn dl(
@@ -743,9 +811,11 @@ async fn dl(
     headers: HeaderMap,
 ) -> Response {
     let ip = addr.ip().to_string();
-    let is_special = state.special_hashes.read().await.contains(&hash);
+    // Look up special_type; any value means this hash is "special"
+    let special_type = state.special_hashes.get(&hash).map(|v| v.clone());
 
-    if referer_blocked(&state, &headers, &ip).await || is_special {
+    if referer_blocked(&state, &headers, &ip).await || special_type.is_some() {
+        // Currently all special_type values redirect to arolinks ads; extend here later
         return redirect_via_ads_or_bot(&state, &headers, &uri.to_string()).await;
     }
 
@@ -784,9 +854,11 @@ async fn watch(
     headers: HeaderMap,
 ) -> Response {
     let ip = addr.ip().to_string();
-    let is_special = state.special_hashes.read().await.contains(&hash);
+    // Look up special_type; any value means this hash is "special"
+    let special_type = state.special_hashes.get(&hash).map(|v| v.clone());
 
-    if referer_blocked(&state, &headers, &ip).await || is_special {
+    if referer_blocked(&state, &headers, &ip).await || special_type.is_some() {
+        // Currently all special_type values redirect to arolinks ads; extend here later
         return redirect_via_ads_or_bot(&state, &headers, &uri.to_string()).await;
     }
 
@@ -842,7 +914,11 @@ async fn stats(State(state): State<AppState>, headers: HeaderMap) -> Response {
         v
     };
     let best = get_best_cdn(&state).await;
-    let specials: Vec<String> = state.special_hashes.read().await.iter().cloned().collect();
+    let specials: Vec<Value> = state
+        .special_hashes
+        .iter()
+        .map(|e| json!({"hash": e.key(), "special_type": e.value()}))
+        .collect();
 
     Json(json!({
         "cdns": cdn_list,
@@ -890,17 +966,37 @@ async fn main() -> anyhow::Result<()> {
         db
     };
 
-    // ── Redis ──────────────────────────────────────────────────
-    let redis_mgr = if let Ok(url) = std::env::var("REDIS_URL") {
-        // fred v9: RedisConfig::from_url (Config alias was removed in v9)
-        let config = RedisConfig::from_url(&url)?;
-        let client = Builder::from_config(config).build()?;
-        // init() drives the connection; TLS is auto-detected from rediss:// URL
-        client.init().await?;
-        Some(client)
-    } else {
-        None
-    };
+    // ── Hash store: MongoDB (MONGO_URL) takes priority over Redis (REDIS_URL) ──
+    let hash_store: Option<HashStoreClient> =
+        if let Ok(mongo_url) = std::env::var("MONGO_URL") {
+            let mongo_client = mongodb::Client::with_uri_str(&mongo_url).await?;
+            // Database name is required via MONGO_DB_NAME
+            let db_name = std::env::var("MONGO_DB_NAME")
+                .unwrap_or_else(|_| "loadbalancer".to_string());
+            // Collection name is required via MONGO_DB_COLLECTION_NAME
+            let col_name = std::env::var("MONGO_DB_COLLECTION_NAME")
+                .unwrap_or_else(|_| "special_hashes".to_string());
+            let col = mongo_client
+                .database(&db_name)
+                .collection::<mongodb::bson::Document>(&col_name);
+            tracing::info!(
+                "Connected to MongoDB (db={}, collection={}) for special hashes",
+                db_name,
+                col_name
+            );
+            Some(HashStoreClient::Mongo(col))
+        } else if let Ok(url) = std::env::var("REDIS_URL") {
+            // fred v9: RedisConfig::from_url (Config alias was removed in v9)
+            let config = RedisConfig::from_url(&url)?;
+            let client = Builder::from_config(config).build()?;
+            // init() drives the connection; TLS is auto-detected from rediss:// URL
+            client.init().await?;
+            tracing::info!("Connected to Redis for special hashes");
+            Some(HashStoreClient::Redis(client))
+        } else {
+            tracing::warn!("No MONGO_URL or REDIS_URL set – special hashes will not persist");
+            None
+        };
 
     // ── HTTP client (no global timeout – set per-request) ──────
     let http_client = reqwest::Client::builder()
@@ -911,8 +1007,8 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         lmdb_env: env,
         lmdb_db,
-        redis_mgr,
-        special_hashes: Arc::new(RwLock::new(HashSet::new())),
+        hash_store,
+        special_hashes: Arc::new(DashMap::new()),
         best_cdn: Arc::new(RwLock::new(BestCdnCache::default())),
         rate_limiter: Arc::new(DashMap::new()),
         trusted_hosts: Arc::new(RwLock::new(HashSet::from([
