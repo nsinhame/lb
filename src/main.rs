@@ -557,8 +557,6 @@ async fn nitai() -> impl IntoResponse {
   .load-bar.danger{background:linear-gradient(90deg,#fc8181,#e53e3e)}
   .hash-chip{background:#2d3748;border-radius:6px;padding:3px 8px;font-size:.75rem;font-family:monospace;color:#e2e8f0;margin:2px;display:inline-block}
   .stype{font-size:.7rem;padding:1px 6px;border-radius:10px;background:#2c5282;color:#90cdf4;margin-left:4px}
-  #refresh-bar{height:3px;background:#2d3748;border-radius:2px;overflow:hidden;margin-bottom:20px}
-  #refresh-progress{height:100%;background:#63b3ed;transition:width linear}
   .section-title{font-size:.95rem;font-weight:600;color:#a0aec0;margin-bottom:10px}
   .empty{color:#4a5568;font-style:italic;font-size:.85rem;padding:12px 0}
   .trusted-list{display:flex;flex-wrap:wrap;gap:6px;margin-top:4px}
@@ -572,8 +570,6 @@ async fn nitai() -> impl IntoResponse {
   <div id="status-bar"><div id="dot"></div><span id="last-update">Loading…</span></div>
 </header>
 <main>
-  <div id="refresh-bar"><div id="refresh-progress" style="width:0%"></div></div>
-
   <div class="row" id="summary-cards">
     <div class="card"><h2>Total CDNs</h2><div class="stat-val" id="total-cdns">–</div><div class="stat-sub">registered</div></div>
     <div class="card"><h2>Online CDNs</h2><div class="stat-val" id="online-cdns" style="color:#68d391">–</div><div class="stat-sub">responding</div></div>
@@ -605,7 +601,6 @@ async fn nitai() -> impl IntoResponse {
 
 <script>
 const REFRESH_MS = 5000;
-let timer, startTime;
 
 function fmtTime(ts) {
   if (!ts) return '—';
@@ -723,20 +718,7 @@ function render(data) {
     trusted.map(h => `<span class="trusted-chip">${h}</span>`).join('');
 }
 
-function startProgress() {
-  const bar = document.getElementById('refresh-progress');
-  startTime = Date.now();
-  clearInterval(timer);
-  timer = setInterval(() => {
-    const elapsed = Date.now() - startTime;
-    const pct = Math.min(100, (elapsed / REFRESH_MS) * 100);
-    bar.style.width = pct + '%';
-    bar.style.transitionDuration = '0ms';
-  }, 50);
-}
-
 async function refresh() {
-  startProgress();
   const data = await fetchStats();
   render(data);
   setTimeout(refresh, REFRESH_MS);
