@@ -1321,12 +1321,15 @@ async fn main() -> anyhow::Result<()> {
     }
 
     rebuild_trusted_hosts(&state).await;
-    load_special_hashes(&state).await;
 
-    // ── Background: refresh special hashes every 60 s ─────────
+    // ── Background: load special hashes on startup, then refresh every 60 s ──
+    // Runs in the background so a slow / unreachable MongoDB or Redis does NOT
+    // block axum::serve() from starting (which would cause a blank page / 502
+    // while the DB connection hangs).
     {
         let s = state.clone();
         tokio::spawn(async move {
+            load_special_hashes(&s).await;
             loop {
                 tokio::time::sleep(Duration::from_secs(60)).await;
                 load_special_hashes(&s).await;
