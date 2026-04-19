@@ -1337,25 +1337,20 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // ── Background: CDN poller (leader instance only) ─────────
-    // On Koyeb, only the instance whose ID ends in "0" is the leader.
-    // Locally (no KOYEB_INSTANCE_ID set) the poller does NOT start;
-    // set IS_LEADER=1 in your .env to force it on.
-    // Leader logic: on Koyeb only the instance whose ID ends in "0" polls.
-    // Everywhere else (local dev, Docker, Render, Fly.io) the poller always runs
-    // unless IS_LEADER=0 is set explicitly to disable it.
-    let is_leader = std::env::var("KOYEB_INSTANCE_ID")
-        .map(|id| id.ends_with('0'))
-        .unwrap_or_else(|_| {
-            std::env::var("IS_LEADER")
-                .map(|v| v != "0")
-                .unwrap_or(true)
-        });
+    // ── Background: CDN poller ────────────────────────────────
+    // LMDB is local to each instance, so every instance must run its own
+    // poller to keep CDN load/status data fresh.
+    // Set IS_LEADER=0 to explicitly disable the poller on this instance.
+    let is_leader = std::env::var("IS_LEADER")
+        .map(|v| v != "0")
+        .unwrap_or(true);
 
     if is_leader {
         let s = state.clone();
         tokio::spawn(poller_task(s));
-        tracing::info!("CDN poller started (leader instance)");
+        tracing::info!("CDN poller started");
+    } else {
+        tracing::warn!("CDN poller disabled (IS_LEADER=0)");
     }
 
     // ── Router ─────────────────────────────────────────────────
