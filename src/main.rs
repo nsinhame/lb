@@ -626,6 +626,24 @@ function loadBarWidth(load) {
 
 const ADMIN_KEY = new URLSearchParams(location.search).get('key') || '';
 
+// If no key in URL, show a login overlay instead of silently failing
+if (!ADMIN_KEY) {
+  document.addEventListener('DOMContentLoaded', () => {
+    const overlay = document.createElement('div');
+    overlay.style.cssText = 'position:fixed;inset:0;background:#0f1117;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;z-index:999';
+    overlay.innerHTML = `
+      <h2 style="color:#63b3ed;font-size:1.4rem">⚡ Nitai Dashboard</h2>
+      <p style="color:#718096;font-size:.9rem">Enter your admin key to continue</p>
+      <input id="key-input" type="password" placeholder="LB_ADMIN_KEY" style="background:#1a1f2e;border:1px solid #2d3748;color:#e2e8f0;border-radius:8px;padding:10px 16px;font-size:1rem;width:300px;outline:none">
+      <button onclick="const k=document.getElementById('key-input').value;if(k)location.search='?key='+encodeURIComponent(k)" style="background:#2b6cb0;color:#fff;border:none;border-radius:8px;padding:10px 24px;font-size:1rem;cursor:pointer">Open Dashboard</button>
+    `;
+    document.body.appendChild(overlay);
+    document.getElementById('key-input').addEventListener('keydown', e => {
+      if (e.key === 'Enter') { const k = e.target.value; if(k) location.search='?key='+encodeURIComponent(k); }
+    });
+  });
+}
+
 async function fetchStats() {
   try {
     const r = await fetch('/stats', { headers: { 'x-admin-key': ADMIN_KEY } });
@@ -1200,6 +1218,15 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Arc::new(Config::from_env());
 
+    // ── Bind TCP listener EARLY so health checks pass during slow init ──
+    let port: u16 = std::env::var("PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(8000);
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    tracing::info!("Listening on {}", addr);
+
     // ── LMDB ──────────────────────────────────────────────────
     // LMDB uses a directory.  Create it if it doesn't exist.
     std::fs::create_dir_all("cdn.lmdb").ok();
@@ -1339,16 +1366,6 @@ async fn main() -> anyhow::Result<()> {
         .route("/stats", get(stats))
         .with_state(state);
 
-    // PORT env var (Koyeb / Render / Fly.io inject this automatically)
-    let port: u16 = std::env::var("PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(8000);
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
-
-    tracing::info!("Listening on {}", addr);
-
-    let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(
         listener,
         // ConnectInfo extractor requires this wrapper
