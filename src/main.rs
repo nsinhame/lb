@@ -646,16 +646,21 @@ if (!ADMIN_KEY) {
 async function fetchStats() {
   try {
     const r = await fetch('/stats', { headers: { 'x-admin-key': ADMIN_KEY } });
-    if (!r.ok) throw new Error(r.status);
+    if (r.status === 401) return { __error: 401 };
+    if (!r.ok) return { __error: r.status };
     return await r.json();
   } catch(e) {
-    return null;
+    return { __error: 0 };
   }
 }
 
 function render(data) {
-  if (!data) {
-    document.getElementById('last-update').textContent = 'Error – retrying…';
+  if (!data || data.__error !== undefined) {
+    const code = data && data.__error;
+    const msg = code === 401 ? 'Wrong admin key – check ?key= in URL'
+               : code === 0  ? 'Cannot reach server'
+               : 'Server error ' + code;
+    document.getElementById('last-update').textContent = msg;
     document.getElementById('dot').style.background = '#fc8181';
     return;
   }
@@ -732,24 +737,24 @@ function openHashType(type) {
 
 async function refreshSpecialHashes() {
   const btn = document.getElementById('sp-refresh-btn');
-  btn.textContent = '&#x21BB; Refreshing…';
+  btn.innerHTML = '&#x21BB; Refreshing…';
   btn.disabled = true;
   try {
     const r = await fetch('/refresh_special_hashes', { method: 'POST', headers: { 'x-admin-key': ADMIN_KEY } });
     if (r.ok) {
       document.getElementById('sp-refresh-time').textContent = 'Last DB sync: ' + new Date().toLocaleTimeString();
       const data = await fetchStats();
-      if (data) render(data);
+      if (data && !data.__error) render(data);
     }
   } finally {
-    btn.textContent = '&#x21BB; Refresh';
+    btn.innerHTML = '&#x21BB; Refresh';
     btn.disabled = false;
   }
 }
 
 async function refresh() {
   const data = await fetchStats();
-  render(data);
+  try { render(data); } catch(e) { console.error('render error:', e); }
   setTimeout(refresh, REFRESH_MS);
 }
 
@@ -804,7 +809,8 @@ async fn special_hashes_by_type(
         .map(|e| e.key().clone())
         .collect();
     hashes.sort();
-    Json(json!({"type": stype, "hashes": hashes, "count": hashes.len()})).into_response()
+    let count = hashes.len();
+    Json(json!({"type": stype, "hashes": hashes, "count": count})).into_response()
 }
 
 async fn nitai_hashes() -> impl IntoResponse {
