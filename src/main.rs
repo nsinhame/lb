@@ -17,7 +17,7 @@ use std::{
 
 use axum::{
     body::Body,
-    extract::{ConnectInfo, Path, State},
+    extract::{ConnectInfo, Path, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{Html, IntoResponse, Json, Response},
     routing::{get, post},
@@ -575,7 +575,7 @@ async fn nitai() -> impl IntoResponse {
     <div class="card"><h2>Online CDNs</h2><div class="stat-val" id="online-cdns" style="color:#68d391">–</div><div class="stat-sub">responding</div></div>
     <div class="card"><h2>Offline CDNs</h2><div class="stat-val" id="offline-cdns" style="color:#fc8181">–</div><div class="stat-sub">unreachable</div></div>
     <div class="card"><h2>Total Load</h2><div class="stat-val" id="total-load">–</div><div class="stat-sub">active connections</div></div>
-    <div class="card"><h2>Special Hashes</h2><div class="stat-val" id="special-count">–</div><div class="stat-sub">in DB</div></div>
+    <div class="card"><h2>Special Hashes</h2><div class="stat-val" id="special-count">–</div><div class="stat-sub">in memory</div></div>
     <div class="card"><h2>Best CDN</h2><div id="best-cdn-val">–</div><div class="stat-sub">current selection</div></div>
   </div>
 
@@ -589,8 +589,12 @@ async fn nitai() -> impl IntoResponse {
 
   <div class="row">
     <div class="card">
-      <div class="section-title">Special Hashes</div>
-      <div id="special-list"><span class="empty">Loading…</span></div>
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
+        <div class="section-title" style="margin-bottom:0">Special Hashes</div>
+        <button id="sp-refresh-btn" onclick="refreshSpecialHashes()" style="background:#2d3748;border:none;color:#90cdf4;border-radius:6px;padding:4px 12px;font-size:.8rem;cursor:pointer">&#x21BB; Refresh</button>
+      </div>
+      <div id="special-type-btns"><span class="empty">–</span></div>
+      <div id="sp-refresh-time" style="font-size:.72rem;color:#4a5568;margin-top:8px"></div>
     </div>
     <div class="card">
       <div class="section-title">Trusted Hosts</div>
@@ -667,7 +671,6 @@ function render(data) {
   document.getElementById('online-cdns').textContent = online.length;
   document.getElementById('offline-cdns').textContent = offline.length;
   document.getElementById('total-load').textContent = totalLoad;
-  document.getElementById('special-count').textContent = (data.special_hashes || []).length;
 
   const best = data.best_cdn;
   const bestEl = document.getElementById('best-cdn-val');
@@ -701,14 +704,19 @@ function render(data) {
     }).join('');
   }
 
-  // Special hashes
+  // Special hashes – group by type, show clickable buttons
   const specials = data.special_hashes || [];
-  const spEl = document.getElementById('special-list');
-  if (specials.length === 0) {
-    spEl.innerHTML = '<span class="empty">No special hashes</span>';
+  document.getElementById('special-count').textContent = specials.length;
+  const typeMap = {};
+  specials.forEach(s => { typeMap[s.special_type] = (typeMap[s.special_type] || 0) + 1; });
+  const spEl = document.getElementById('special-type-btns');
+  const types = Object.keys(typeMap);
+  if (types.length === 0) {
+    spEl.innerHTML = '<span class="empty">No special hashes in memory</span>';
   } else {
-    spEl.innerHTML = specials.map(s =>
-      `<span class="hash-chip">${s.hash.slice(0,16)}…<span class="stype">${s.special_type}</span></span>`
+    spEl.innerHTML = types.map(t =>
+      '<button onclick="openHashType(\'' + t + '\')" style="background:#1a365d;border:none;color:#90cdf4;border-radius:8px;padding:6px 14px;font-size:.82rem;cursor:pointer;margin:2px;font-weight:600">' +
+      t + ' <span style="background:#2c5282;border-radius:10px;padding:1px 7px;margin-left:4px">' + typeMap[t] + '</span></button>'
     ).join('');
   }
 
@@ -716,6 +724,27 @@ function render(data) {
   const trusted = data.trusted_hosts || [];
   document.getElementById('trusted-list').innerHTML =
     trusted.map(h => `<span class="trusted-chip">${h}</span>`).join('');
+}
+
+function openHashType(type) {
+  window.open('/nitai/hashes?type=' + encodeURIComponent(type) + '&key=' + encodeURIComponent(ADMIN_KEY), '_blank');
+}
+
+async function refreshSpecialHashes() {
+  const btn = document.getElementById('sp-refresh-btn');
+  btn.textContent = '&#x21BB; Refreshing…';
+  btn.disabled = true;
+  try {
+    const r = await fetch('/refresh_special_hashes', { method: 'POST', headers: { 'x-admin-key': ADMIN_KEY } });
+    if (r.ok) {
+      document.getElementById('sp-refresh-time').textContent = 'Last DB sync: ' + new Date().toLocaleTimeString();
+      const data = await fetchStats();
+      if (data) render(data);
+    }
+  } finally {
+    btn.textContent = '&#x21BB; Refresh';
+    btn.disabled = false;
+  }
 }
 
 async function refresh() {
@@ -732,6 +761,111 @@ refresh();
 }
 
 
+
+// ============================================================
+// SPECIAL HASHES – REFRESH & BY-TYPE ENDPOINTS
+// ============================================================
+
+async fn refresh_special_hashes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(e) = check_admin(&headers, &state.config) {
+        return e;
+    }
+    load_special_hashes(&state).await;
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for entry in state.special_hashes.iter() {
+        *counts.entry(entry.value().clone()).or_insert(0) += 1;
+    }
+    let total = state.special_hashes.len();
+    Json(json!({"counts": counts, "total": total})).into_response()
+}
+
+#[derive(Deserialize)]
+struct ByTypeQuery {
+    #[serde(rename = "type")]
+    stype: Option<String>,
+}
+
+async fn special_hashes_by_type(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<ByTypeQuery>,
+) -> Response {
+    if let Err(e) = check_admin(&headers, &state.config) {
+        return e;
+    }
+    let stype = q.stype.unwrap_or_default();
+    let mut hashes: Vec<String> = state
+        .special_hashes
+        .iter()
+        .filter(|e| *e.value() == stype)
+        .map(|e| e.key().clone())
+        .collect();
+    hashes.sort();
+    Json(json!({"type": stype, "hashes": hashes, "count": hashes.len()})).into_response()
+}
+
+async fn nitai_hashes() -> impl IntoResponse {
+    let html = r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Special Hashes – Nitai</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:'Segoe UI',system-ui,sans-serif;background:#0f1117;color:#e2e8f0;min-height:100vh;padding:24px 32px}
+  h1{color:#63b3ed;font-size:1.4rem;margin-bottom:6px}
+  .sub{color:#718096;font-size:.85rem;margin-bottom:4px}
+  .back{background:#2d3748;border:none;color:#90cdf4;border-radius:8px;padding:8px 16px;font-size:.85rem;cursor:pointer;margin-bottom:20px;display:inline-block}
+  .hash-list{display:flex;flex-direction:column;gap:6px;margin-top:16px}
+  .hash-row{background:#1a1f2e;border:1px solid #2d3748;border-radius:8px;padding:10px 14px;font-family:monospace;font-size:.85rem;color:#e2e8f0;word-break:break-all}
+  .empty{color:#4a5568;font-style:italic}
+  .count-badge{background:#2c5282;color:#90cdf4;border-radius:10px;padding:2px 10px;font-size:.78rem;margin-left:10px;font-family:sans-serif}
+</style>
+</head>
+<body>
+<button class="back" onclick="history.back()">&#x2190; Back</button>
+<h1 id="page-title">Special Hashes</h1>
+<div class="sub" id="page-sub">Loading&#x2026;</div>
+<div id="hash-list" class="hash-list"><span class="empty">Loading&#x2026;</span></div>
+<script>
+const params = new URLSearchParams(location.search);
+const ADMIN_KEY = params.get('key') || '';
+const TYPE = params.get('type') || '';
+document.getElementById('page-title').textContent = TYPE ? TYPE + ' Hashes' : 'Special Hashes';
+async function load() {
+  try {
+    const r = await fetch('/special_hashes_by_type?type=' + encodeURIComponent(TYPE), {
+      headers: { 'x-admin-key': ADMIN_KEY }
+    });
+    if (!r.ok) {
+      document.getElementById('page-sub').textContent = 'Error: ' + r.status;
+      document.getElementById('hash-list').innerHTML = '<span class="empty">Unauthorized or server error</span>';
+      return;
+    }
+    const data = await r.json();
+    const hashes = data.hashes || [];
+    document.getElementById('page-sub').innerHTML =
+      'Type: <strong>' + data.type + '</strong>' +
+      '<span class="count-badge">' + hashes.length + ' hashes</span>';
+    if (hashes.length === 0) {
+      document.getElementById('hash-list').innerHTML = '<span class="empty">No hashes of this type</span>';
+    } else {
+      document.getElementById('hash-list').innerHTML =
+        hashes.map(h => '<div class="hash-row">' + h + '</div>').join('');
+    }
+  } catch(e) {
+    document.getElementById('hash-list').innerHTML = '<span class="empty">Failed to load</span>';
+  }
+}
+load();
+</script>
+</body>
+</html>"#;
+    Html(html)
+}
 
 fn fix_video_src(html: &str, hash: &str, filename: &str) -> String {
     let escaped = regex::escape(hash);
@@ -1304,18 +1438,14 @@ async fn main() -> anyhow::Result<()> {
 
     rebuild_trusted_hosts(&state).await;
 
-    // ── Background: load special hashes on startup, then refresh every 60 s ──
+    // ── Background: load special hashes once on startup ───────
     // Runs in the background so a slow / unreachable MongoDB or Redis does NOT
-    // block axum::serve() from starting (which would cause a blank page / 502
-    // while the DB connection hangs).
+    // block axum::serve() from starting.  After startup, hashes are only
+    // refreshed from the database when the admin clicks Refresh in the dashboard.
     {
         let s = state.clone();
         tokio::spawn(async move {
             load_special_hashes(&s).await;
-            loop {
-                tokio::time::sleep(Duration::from_secs(60)).await;
-                load_special_hashes(&s).await;
-            }
         });
     }
 
@@ -1339,11 +1469,14 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/health", get(health))
         .route("/nitai", get(nitai))
+        .route("/nitai/hashes", get(nitai_hashes))
         .route("/add_cdn", post(add_cdn))
         .route("/add_special", post(add_special))
         .route("/dl/:hash/*filename", get(dl))
         .route("/watch/:hash/*filename", get(watch))
         .route("/stats", get(stats))
+        .route("/refresh_special_hashes", post(refresh_special_hashes))
+        .route("/special_hashes_by_type", get(special_hashes_by_type))
         .with_state(state);
 
     axum::serve(
