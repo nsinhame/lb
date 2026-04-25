@@ -109,6 +109,12 @@ struct CdnMeta {
     updated_at: u64,
     #[serde(rename = "_ts", default)]
     ts: u64,
+    /// Error description when offline (e.g. "timeout", "HTTP 503")
+    #[serde(default)]
+    error_code: String,
+    /// Resolved IP address (used to deduplicate multi-URL CDNs)
+    #[serde(default)]
+    ip: String,
 }
 
 // ============================================================
@@ -313,18 +319,35 @@ async fn get_best_cdn(state: &AppState) -> Option<String> {
 
     let cdns = lmdb_list_cdns(state).await;
 
-    // Lowest load among online CDNs
-    let min_load = cdns
-        .iter()
-        .filter(|(_, m)| m.last_ok == 1)
-        .map(|(_, m)| m.load)
-        .min()?; // None when no CDN is online
+    // Deduplicate by IP: if two URLs resolve to the same server, only count once.
+    // For each IP group, keep the URL with the lowest load.
+    let mut ip_best: std::collections::HashMap<String, (String, u64)> =
+        std::collections::HashMap::new();
+    for (url, meta) in &cdns {
+        if meta.last_ok != 1 {
+            continue;
+        }
+        // Fall back to URL as key when IP is unknown (avoids false dedup)
+        let key = if meta.ip.is_empty() { url.clone() } else { meta.ip.clone() };
+        match ip_best.get(&key) {
+            None => {
+                ip_best.insert(key, (url.clone(), meta.load));
+            }
+            Some((_, prev_load)) if meta.load < *prev_load => {
+                ip_best.insert(key, (url.clone(), meta.load));
+            }
+            _ => {}
+        }
+    }
+
+    // Lowest load among deduplicated online CDNs
+    let min_load = ip_best.values().map(|(_, l)| *l).min()?;
 
     // All CDNs within ±1 load unit of the minimum
-    let candidates: Vec<String> = cdns
-        .iter()
-        .filter(|(_, m)| m.last_ok == 1 && m.load.abs_diff(min_load) <= 1)
-        .map(|(u, _)| u.clone())
+    let candidates: Vec<String> = ip_best
+        .into_values()
+        .filter(|(_, l)| l.abs_diff(min_load) <= 1)
+        .map(|(u, _)| u)
         .collect();
 
     let chosen = candidates
@@ -614,7 +637,13 @@ function render(data) {
   const cdns = data.cdns || [];
   const online = cdns.filter(c => c.last_ok === 1);
   const offline = cdns.filter(c => c.last_ok !== 1);
-  const totalLoad = online.reduce((s, c) => s + (c.load < 99999 ? c.load : 0), 0);
+  const seenIps = new Set();
+  const totalLoad = online.reduce((s, c) => {
+    const key = c.ip || c.url;
+    if (seenIps.has(key)) return s;
+    seenIps.add(key);
+    return s + (c.load < 99999 ? c.load : 0);
+  }, 0);
 
   document.getElementById('total-cdns').textContent = cdns.length;
   document.getElementById('online-cdns').textContent = online.length;
@@ -643,8 +672,8 @@ function render(data) {
       const bw = loadBarWidth(c.load);
       const loadDisp = c.load >= 99999 ? '∞' : c.load;
       return `<tr>
-        <td title="${c.url}" style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${host}</td>
-        <td><span class="badge ${c.last_ok === 1 ? 'online' : 'offline'}">${c.last_ok === 1 ? 'Online' : 'Offline'}</span></td>
+        <td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><a href="${c.url}/status" target="_blank" rel="noopener" style="color:#63b3ed;text-decoration:none" title="${c.url}/status">${host}</a></td>
+        <td><span class="badge ${c.last_ok === 1 ? 'online' : 'offline'}">${c.last_ok === 1 ? 'Online' : 'Offline'}</span>${c.last_ok !== 1 && c.error_code ? `<br><span style="font-size:.75rem;color:#fc8181">${c.error_code}</span>` : ''}</td>
         <td>${loadDisp}</td>
         <td><div class="load-bar-wrap"><div class="load-bar ${lc}" style="width:${bw}%"></div></div></td>
         <td>${c.fail_count}</td>
@@ -690,7 +719,20 @@ fn fix_video_src(html: &str, hash: &str, filename: &str) -> String {
 // CDN HEALTH CHECK
 // ============================================================
 
-async fn check_cdn_health(client: Client, url: String) -> (String, bool, u64) {
+/// Resolve the first IP address for a CDN URL (best-effort, returns empty string on failure).
+async fn resolve_cdn_ip(url: &str) -> String {
+    let Ok(parsed) = url::Url::parse(url) else { return String::new() };
+    let Some(host) = parsed.host_str() else { return String::new() };
+    let port = parsed.port_or_known_default().unwrap_or(80);
+    let Ok(mut addrs) = tokio::net::lookup_host(format!("{}:{}", host, port)).await else {
+        return String::new();
+    };
+    addrs.next().map(|a| a.ip().to_string()).unwrap_or_default()
+}
+
+/// Returns (url, ok, load, error_code, ip)
+async fn check_cdn_health(client: Client, url: String) -> (String, bool, u64, String, String) {
+    let ip = resolve_cdn_ip(&url).await;
     let result = client
         .get(format!("{}/status", url))
         .timeout(Duration::from_secs(3))
@@ -698,18 +740,31 @@ async fn check_cdn_health(client: Client, url: String) -> (String, bool, u64) {
         .await;
 
     match result {
-        Ok(resp) => match resp.json::<Value>().await {
-            Ok(js) => {
-                let total: u64 = js
-                    .get("loads")
-                    .and_then(|l| l.as_object())
-                    .map(|m| m.values().filter_map(|v| v.as_u64()).sum())
-                    .unwrap_or(99999);
-                (url, true, total)
+        Ok(resp) => {
+            let status = resp.status();
+            if !status.is_success() {
+                return (url, false, 99999, format!("HTTP {}", status.as_u16()), ip);
             }
-            Err(_) => (url, false, 99999),
-        },
-        Err(_) => (url, false, 99999),
+            match resp.json::<Value>().await {
+                Ok(js) => {
+                    let total: u64 = js
+                        .get("loads")
+                        .and_then(|l| l.as_object())
+                        .map(|m| m.values().filter_map(|v| v.as_u64()).sum())
+                        .unwrap_or(99999);
+                    (url, true, total, String::new(), ip)
+                }
+                Err(_) => (url, false, 99999, "invalid response".to_string(), ip),
+            }
+        }
+        Err(e) => {
+            let err = if e.is_timeout() {
+                "timeout".to_string()
+            } else {
+                "no response".to_string()
+            };
+            (url, false, 99999, err, ip)
+        }
     }
 }
 
@@ -735,7 +790,7 @@ async fn poller_task(state: AppState) {
             cdns.into_iter().collect();
 
         for handle in handles {
-            let Ok((url, ok, load)) = handle.await else {
+            let Ok((url, ok, load, error_code, ip)) = handle.await else {
                 continue;
             };
             let prev_fail = prev_map
@@ -752,6 +807,8 @@ async fn poller_task(state: AppState) {
                         last_ok: 1,
                         fail_count: 0,
                         updated_at: now_unix(),
+                        error_code: String::new(),
+                        ip,
                         ts: 0,
                     },
                 )
@@ -770,6 +827,8 @@ async fn poller_task(state: AppState) {
                             last_ok: 0,
                             fail_count,
                             updated_at: now_unix(),
+                            error_code,
+                            ip,
                             ts: 0,
                         },
                     )
@@ -915,7 +974,7 @@ async fn add_cdn(
                 handles.push(tokio::spawn(check_cdn_health(client, url)));
             }
             for handle in handles {
-                let Ok((url, ok, load)) = handle.await else {
+                let Ok((url, ok, load, error_code, ip)) = handle.await else {
                     continue;
                 };
                 if ok {
@@ -927,13 +986,15 @@ async fn add_cdn(
                             last_ok: 1,
                             fail_count: 0,
                             updated_at: now_unix(),
+                            error_code: String::new(),
+                            ip,
                             ts: 0,
                         },
                     )
                     .await;
                     tracing::info!("CDN {} is online (load={})", url, load);
                 } else {
-                    tracing::warn!("CDN {} did not respond to initial health check", url);
+                    tracing::warn!("CDN {} did not respond to initial health check: {}", url, error_code);
                 }
             }
             // Invalidate cache so next request picks up the new CDN immediately
@@ -1054,6 +1115,8 @@ async fn stats(State(state): State<AppState>, headers: HeaderMap) -> Response {
                 "last_ok": meta.last_ok,
                 "fail_count": format!("{}/{}", meta.fail_count, state.config.fail_threshold),
                 "updated_at": meta.updated_at,
+                "error_code": meta.error_code,
+                "ip": meta.ip,
             })
         })
         .collect();
