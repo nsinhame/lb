@@ -87,7 +87,7 @@ impl Config {
                 .map(|s| s.trim().to_lowercase())
                 .filter(|s| !s.is_empty())
                 .collect(),
-            best_cdn_ttl: Duration::from_secs(4),
+            best_cdn_ttl: Duration::from_secs(poll_interval),
         }
     }
 }
