@@ -8,12 +8,10 @@ edition = "2021"
 axum = "0.7"
 # Async runtime
 tokio = { version = "1", features = ["full"] }
-# Async HTTP client (for CDN health checks, Arolinks, streaming proxy)
+# Async HTTP client (for CDN health checks, streaming proxy)
 reqwest = { version = "0.12", features = ["json", "stream"] }
 # Embedded LMDB key-value store (CDN registry)
 heed = "0.20"
-# Redis client (special hashes) – fred has reliable native-TLS for rediss:// URLs
-fred = { version = "9", features = ["enable-native-tls"] }
 # Concurrent hashmap for rate limiter
 dashmap = "6"
 # .env file loader
@@ -32,7 +30,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rand = "0.8"
 # Ergonomic error handling in main()
 anyhow = "1"
-# MongoDB client (special hashes – alternative to Redis)
+# MongoDB client (special hashes)
 mongodb = "2"
 
 [profile.release]

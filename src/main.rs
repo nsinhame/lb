@@ -3,8 +3,7 @@
 //! Stack:
 //!   axum 0.7  – HTTP server
 //!   heed 0.20 – embedded LMDB for CDN registry
-//!   redis     – special-hash store (optional, set REDIS_URL)
-//!   mongodb   – special-hash store (optional, set MONGO_URL; takes priority over Redis)
+//!   mongodb   – special-hash store (MONGO_URL)
 //!   reqwest   – outbound HTTP (health checks, Arolinks, streaming proxy)
 //!   dashmap   – lock-free concurrent rate-limiter map
 
@@ -17,7 +16,7 @@ use std::{
 
 use axum::{
     body::Body,
-    extract::{ConnectInfo, Path, Query, State},
+    extract::{ConnectInfo, Path, State},
     http::{header, HeaderMap, StatusCode},
     response::{Html, IntoResponse, Json, Response},
     routing::{get, post},
@@ -27,7 +26,6 @@ use dashmap::DashMap;
 use dotenvy::dotenv;
 use heed::{Database, Env, EnvOpenOptions};
 use rand::seq::SliceRandom;
-use fred::prelude::*;
 use mongodb::bson::doc;
 use regex::Regex;
 use reqwest::Client;
@@ -68,8 +66,7 @@ impl Config {
             arolinks_api: std::env::var("AROLINKS_API_TOKEN").ok(),
             arolinks_endpoint: "https://arolinks.com/api".to_string(),
             admin_key: std::env::var("LB_ADMIN_KEY").unwrap_or_default(),
-            tg_redirect: std::env::var("REDIRECT_TO")
-                .unwrap_or_else(|_| "https://t.me/ppsl24_bot".to_string()),
+            tg_redirect: std::env::var("REDIRECT_TO").unwrap_or_default(),
             max_requests_per_ip: std::env::var("LB_MAX_REQUESTS_PER_IP")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -143,16 +140,6 @@ impl Default for BestCdnCache {
 }
 
 // ============================================================
-// HASH STORE  (Redis or MongoDB – holds the special-hashes set)
-// ============================================================
-
-#[derive(Clone)]
-enum HashStoreClient {
-    Redis(RedisClient),
-    Mongo(mongodb::Collection<mongodb::bson::Document>),
-}
-
-// ============================================================
 // SHARED APPLICATION STATE  (cheap to Clone – everything is Arc-backed)
 // ============================================================
 
@@ -160,9 +147,9 @@ enum HashStoreClient {
 struct AppState {
     lmdb_env: Arc<Env>,
     lmdb_db: CdnDb,
-    /// None when neither REDIS_URL nor MONGO_URL is set
-    hash_store: Option<HashStoreClient>,
-    /// key = file hash, value = special_type string (e.g. "default", "vip", …)
+    /// MongoDB collection for special hashes (None if MONGO_URL not set)
+    mongo_col: Option<mongodb::Collection<mongodb::bson::Document>>,
+    /// key = file hash, value = special_type ("zero_ad", "one_ad", "two_ad", …)
     special_hashes: Arc<DashMap<String, String>>,
     best_cdn: Arc<RwLock<BestCdnCache>>,
     /// key = "ip:hash", value = list of request timestamps
@@ -265,55 +252,47 @@ async fn rebuild_trusted_hosts(state: &AppState) {
 }
 
 // ============================================================
-// HASH STORE – SPECIAL HASHES  (Redis or MongoDB)
+// SPECIAL HASHES  (MongoDB only)
 // ============================================================
 
+/// Full sync from MongoDB into the in-memory DashMap.
+/// Uses a streaming cursor so there is NO timeout: 200k+ docs will all be
+/// loaded, as long as MongoDB keeps sending data.  The old map contents are
+/// replaced atomically only after the cursor is exhausted, so in-flight
+/// requests always see a consistent snapshot.
 async fn load_special_hashes(state: &AppState) {
-    match &state.hash_store {
-        None => {
-            state.special_hashes.clear();
-        }
-        Some(HashStoreClient::Redis(client)) => {
-            match client.smembers::<HashSet<String>, _>("special_hashes").await {
-                Ok(set) => {
-                    state.special_hashes.clear();
-                    for h in set {
-                        state.special_hashes.insert(h, "default".to_string());
-                    }
-                }
-                Err(e) => debug!("Redis error loading special hashes: {}", e),
-            }
-        }
-        Some(HashStoreClient::Mongo(col)) => {
-            match col.find(None, None).await {
-                Ok(mut cursor) => {
-                    state.special_hashes.clear();
-                    loop {
-                        match cursor.advance().await {
-                            Ok(true) => {
-                                if let Ok(doc) = cursor.deserialize_current() {
-                                    // _id may be an ObjectId OR a plain string – handle both
-                                    let id_str = doc
-                                        .get_object_id("_id")
-                                        .map(|oid| oid.to_hex())
-                                        .or_else(|_| {
-                                            doc.get_str("_id").map(|s| s.to_string())
-                                        });
-                                    if let (Ok(id), Ok(stype)) =
-                                        (id_str, doc.get_str("special_type"))
-                                    {
-                                        state.special_hashes
-                                            .insert(id, stype.to_string());
-                                    }
-                                }
+    let Some(col) = &state.mongo_col else {
+        return; // MongoDB not configured – nothing to do
+    };
+    match col.find(None, None).await {
+        Ok(mut cursor) => {
+            let mut fresh: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            loop {
+                match cursor.advance().await {
+                    Ok(true) => {
+                        if let Ok(doc) = cursor.deserialize_current() {
+                            let id = doc
+                                .get_object_id("_id")
+                                .map(|oid| oid.to_hex())
+                                .or_else(|_| doc.get_str("_id").map(|s| s.to_string()));
+                            let stype = doc.get_str("special_type").map(|s| s.to_string());
+                            if let (Ok(id), Ok(stype)) = (id, stype) {
+                                fresh.insert(id, stype);
                             }
-                            _ => break,
                         }
                     }
+                    _ => break,
                 }
-                Err(e) => debug!("MongoDB error loading special hashes: {}", e),
             }
+            // Swap in the fresh snapshot atomically
+            state.special_hashes.retain(|k, _| fresh.contains_key(k.as_str()));
+            for (k, v) in fresh {
+                state.special_hashes.insert(k, v);
+            }
+            debug!("Loaded {} special hashes from MongoDB", state.special_hashes.len());
         }
+        Err(e) => tracing::error!("MongoDB error loading special hashes: {}", e),
     }
 }
 
@@ -436,12 +415,7 @@ fn check_admin(headers: &HeaderMap, config: &Config) -> Result<(), Response> {
 // AD-REDIRECT / AROLINKS
 // ============================================================
 
-async fn arolinks_shorten(
-    client: &Client,
-    api: &str,
-    endpoint: &str,
-    raw_url: &str,
-) -> Option<String> {
+async fn arolinks_shorten(client: &Client, api: &str, endpoint: &str, raw_url: &str) -> Option<String> {
     let resp = client
         .get(endpoint)
         .query(&[("api", api), ("url", raw_url)])
@@ -465,19 +439,14 @@ async fn handle_special_redirect(state: &AppState, special_type: &str) -> Respon
     let tg = state.config.tg_redirect.clone();
 
     match special_type {
-        // zero_ad: skip all ads, go straight to the Telegram bot
+        // zero_ad: no ads – go straight to the Telegram bot
         "zero_ad" => axum::response::Redirect::to(&tg).into_response(),
 
-        // one_ad: one Arolinks ad whose destination is the Telegram bot
+        // one_ad: one Arolinks ad, destination is the Telegram bot
         "one_ad" => {
             if let Some(api) = &state.config.arolinks_api {
-                if let Some(short) = arolinks_shorten(
-                    &state.http_client,
-                    api,
-                    &state.config.arolinks_endpoint,
-                    &tg,
-                )
-                .await
+                if let Some(short) =
+                    arolinks_shorten(&state.http_client, api, &state.config.arolinks_endpoint, &tg).await
                 {
                     return axum::response::Redirect::to(&short).into_response();
                 }
@@ -488,34 +457,22 @@ async fn handle_special_redirect(state: &AppState, special_type: &str) -> Respon
         // two_ad: two chained Arolinks ads; second ad leads to Telegram bot
         "two_ad" => {
             if let Some(api) = &state.config.arolinks_api {
-                // Step 1: shorten the Telegram bot URL  (this becomes ad #2's destination)
-                if let Some(short2) = arolinks_shorten(
-                    &state.http_client,
-                    api,
-                    &state.config.arolinks_endpoint,
-                    &tg,
-                )
-                .await
+                if let Some(short2) =
+                    arolinks_shorten(&state.http_client, api, &state.config.arolinks_endpoint, &tg).await
                 {
-                    // Step 2: shorten short2 (this becomes ad #1's destination)
-                    if let Some(short1) = arolinks_shorten(
-                        &state.http_client,
-                        api,
-                        &state.config.arolinks_endpoint,
-                        &short2,
-                    )
-                    .await
+                    if let Some(short1) =
+                        arolinks_shorten(&state.http_client, api, &state.config.arolinks_endpoint, &short2).await
                     {
                         return axum::response::Redirect::to(&short1).into_response();
                     }
-                    // If second shorten fails, degrade gracefully to one ad
+                    // Second shorten failed – degrade to one ad
                     return axum::response::Redirect::to(&short2).into_response();
                 }
             }
             axum::response::Redirect::to(&tg).into_response()
         }
 
-        // Unknown / future types: fall back to bot
+        // Unknown type – fall back to Telegram bot
         _ => axum::response::Redirect::to(&tg).into_response(),
     }
 }
@@ -555,8 +512,6 @@ async fn nitai() -> impl IntoResponse {
   .load-bar{height:100%;border-radius:4px;background:linear-gradient(90deg,#63b3ed,#4299e1);transition:width .4s}
   .load-bar.warn{background:linear-gradient(90deg,#f6ad55,#ed8936)}
   .load-bar.danger{background:linear-gradient(90deg,#fc8181,#e53e3e)}
-  .hash-chip{background:#2d3748;border-radius:6px;padding:3px 8px;font-size:.75rem;font-family:monospace;color:#e2e8f0;margin:2px;display:inline-block}
-  .stype{font-size:.7rem;padding:1px 6px;border-radius:10px;background:#2c5282;color:#90cdf4;margin-left:4px}
   .section-title{font-size:.95rem;font-weight:600;color:#a0aec0;margin-bottom:10px}
   .empty{color:#4a5568;font-style:italic;font-size:.85rem;padding:12px 0}
   .trusted-list{display:flex;flex-wrap:wrap;gap:6px;margin-top:4px}
@@ -575,7 +530,6 @@ async fn nitai() -> impl IntoResponse {
     <div class="card"><h2>Online CDNs</h2><div class="stat-val" id="online-cdns" style="color:#68d391">–</div><div class="stat-sub">responding</div></div>
     <div class="card"><h2>Offline CDNs</h2><div class="stat-val" id="offline-cdns" style="color:#fc8181">–</div><div class="stat-sub">unreachable</div></div>
     <div class="card"><h2>Total Load</h2><div class="stat-val" id="total-load">–</div><div class="stat-sub">active connections</div></div>
-    <div class="card"><h2>Special Hashes</h2><div class="stat-val" id="special-count">–</div><div class="stat-sub">in memory</div></div>
     <div class="card"><h2>Best CDN</h2><div id="best-cdn-val">–</div><div class="stat-sub">current selection</div></div>
   </div>
 
@@ -587,19 +541,9 @@ async fn nitai() -> impl IntoResponse {
     </table>
   </div>
 
-  <div class="row">
-    <div class="card">
-      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
-        <div class="section-title" style="margin-bottom:0">Special Hashes</div>
-        <button id="sp-refresh-btn" onclick="refreshSpecialHashes()" style="background:#2d3748;border:none;color:#90cdf4;border-radius:6px;padding:4px 12px;font-size:.8rem;cursor:pointer">&#x21BB; Refresh</button>
-      </div>
-      <div id="special-type-btns"><span class="empty">–</span></div>
-      <div id="sp-refresh-time" style="font-size:.72rem;color:#4a5568;margin-top:8px"></div>
-    </div>
-    <div class="card">
-      <div class="section-title">Trusted Hosts</div>
-      <div class="trusted-list" id="trusted-list"></div>
-    </div>
+  <div class="card">
+    <div class="section-title">Trusted Hosts</div>
+    <div class="trusted-list" id="trusted-list"></div>
   </div>
 </main>
 
@@ -709,47 +653,10 @@ function render(data) {
     }).join('');
   }
 
-  // Special hashes – group by type, show clickable buttons
-  const specials = data.special_hashes || [];
-  document.getElementById('special-count').textContent = specials.length;
-  const typeMap = {};
-  specials.forEach(s => { typeMap[s.special_type] = (typeMap[s.special_type] || 0) + 1; });
-  const spEl = document.getElementById('special-type-btns');
-  const types = Object.keys(typeMap);
-  if (types.length === 0) {
-    spEl.innerHTML = '<span class="empty">No special hashes in memory</span>';
-  } else {
-    spEl.innerHTML = types.map(t =>
-      '<button onclick="openHashType(\'' + t + '\')" style="background:#1a365d;border:none;color:#90cdf4;border-radius:8px;padding:6px 14px;font-size:.82rem;cursor:pointer;margin:2px;font-weight:600">' +
-      t + ' <span style="background:#2c5282;border-radius:10px;padding:1px 7px;margin-left:4px">' + typeMap[t] + '</span></button>'
-    ).join('');
-  }
-
   // Trusted hosts
   const trusted = data.trusted_hosts || [];
   document.getElementById('trusted-list').innerHTML =
     trusted.map(h => `<span class="trusted-chip">${h}</span>`).join('');
-}
-
-function openHashType(type) {
-  window.open('/nitai/hashes?type=' + encodeURIComponent(type) + '&key=' + encodeURIComponent(ADMIN_KEY), '_blank');
-}
-
-async function refreshSpecialHashes() {
-  const btn = document.getElementById('sp-refresh-btn');
-  btn.innerHTML = '&#x21BB; Refreshing…';
-  btn.disabled = true;
-  try {
-    const r = await fetch('/refresh_special_hashes', { method: 'POST', headers: { 'x-admin-key': ADMIN_KEY } });
-    if (r.ok) {
-      document.getElementById('sp-refresh-time').textContent = 'Last DB sync: ' + new Date().toLocaleTimeString();
-      const data = await fetchStats();
-      if (data && !data.__error) render(data);
-    }
-  } finally {
-    btn.innerHTML = '&#x21BB; Refresh';
-    btn.disabled = false;
-  }
 }
 
 async function refresh() {
@@ -766,112 +673,6 @@ refresh();
 }
 
 
-
-// ============================================================
-// SPECIAL HASHES – REFRESH & BY-TYPE ENDPOINTS
-// ============================================================
-
-async fn refresh_special_hashes(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Response {
-    if let Err(e) = check_admin(&headers, &state.config) {
-        return e;
-    }
-    load_special_hashes(&state).await;
-    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    for entry in state.special_hashes.iter() {
-        *counts.entry(entry.value().clone()).or_insert(0) += 1;
-    }
-    let total = state.special_hashes.len();
-    Json(json!({"counts": counts, "total": total})).into_response()
-}
-
-#[derive(Deserialize)]
-struct ByTypeQuery {
-    #[serde(rename = "type")]
-    stype: Option<String>,
-}
-
-async fn special_hashes_by_type(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(q): Query<ByTypeQuery>,
-) -> Response {
-    if let Err(e) = check_admin(&headers, &state.config) {
-        return e;
-    }
-    let stype = q.stype.unwrap_or_default();
-    let mut hashes: Vec<String> = state
-        .special_hashes
-        .iter()
-        .filter(|e| *e.value() == stype)
-        .map(|e| e.key().clone())
-        .collect();
-    hashes.sort();
-    let count = hashes.len();
-    Json(json!({"type": stype, "hashes": hashes, "count": count})).into_response()
-}
-
-async fn nitai_hashes() -> impl IntoResponse {
-    let html = r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Special Hashes – Nitai</title>
-<style>
-  *{box-sizing:border-box;margin:0;padding:0}
-  body{font-family:'Segoe UI',system-ui,sans-serif;background:#0f1117;color:#e2e8f0;min-height:100vh;padding:24px 32px}
-  h1{color:#63b3ed;font-size:1.4rem;margin-bottom:6px}
-  .sub{color:#718096;font-size:.85rem;margin-bottom:4px}
-  .back{background:#2d3748;border:none;color:#90cdf4;border-radius:8px;padding:8px 16px;font-size:.85rem;cursor:pointer;margin-bottom:20px;display:inline-block}
-  .hash-list{display:flex;flex-direction:column;gap:6px;margin-top:16px}
-  .hash-row{background:#1a1f2e;border:1px solid #2d3748;border-radius:8px;padding:10px 14px;font-family:monospace;font-size:.85rem;color:#e2e8f0;word-break:break-all}
-  .empty{color:#4a5568;font-style:italic}
-  .count-badge{background:#2c5282;color:#90cdf4;border-radius:10px;padding:2px 10px;font-size:.78rem;margin-left:10px;font-family:sans-serif}
-</style>
-</head>
-<body>
-<button class="back" onclick="history.back()">&#x2190; Back</button>
-<h1 id="page-title">Special Hashes</h1>
-<div class="sub" id="page-sub">Loading&#x2026;</div>
-<div id="hash-list" class="hash-list"><span class="empty">Loading&#x2026;</span></div>
-<script>
-const params = new URLSearchParams(location.search);
-const ADMIN_KEY = params.get('key') || '';
-const TYPE = params.get('type') || '';
-document.getElementById('page-title').textContent = TYPE ? TYPE + ' Hashes' : 'Special Hashes';
-async function load() {
-  try {
-    const r = await fetch('/special_hashes_by_type?type=' + encodeURIComponent(TYPE), {
-      headers: { 'x-admin-key': ADMIN_KEY }
-    });
-    if (!r.ok) {
-      document.getElementById('page-sub').textContent = 'Error: ' + r.status;
-      document.getElementById('hash-list').innerHTML = '<span class="empty">Unauthorized or server error</span>';
-      return;
-    }
-    const data = await r.json();
-    const hashes = data.hashes || [];
-    document.getElementById('page-sub').innerHTML =
-      'Type: <strong>' + data.type + '</strong>' +
-      '<span class="count-badge">' + hashes.length + ' hashes</span>';
-    if (hashes.length === 0) {
-      document.getElementById('hash-list').innerHTML = '<span class="empty">No hashes of this type</span>';
-    } else {
-      document.getElementById('hash-list').innerHTML =
-        hashes.map(h => '<div class="hash-row">' + h + '</div>').join('');
-    }
-  } catch(e) {
-    document.getElementById('hash-list').innerHTML = '<span class="empty">Failed to load</span>';
-  }
-}
-load();
-</script>
-</body>
-</html>"#;
-    Html(html)
-}
 
 fn fix_video_src(html: &str, hash: &str, filename: &str) -> String {
     let escaped = regex::escape(hash);
@@ -1145,55 +946,6 @@ async fn add_cdn(
     Json(json!({"added": added})).into_response()
 }
 
-async fn add_special(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    axum::extract::Json(body): axum::extract::Json<Value>,
-) -> Response {
-    if let Err(e) = check_admin(&headers, &state.config) {
-        return e;
-    }
-    let hashes: Vec<String> = body
-        .get("hashes")
-        .and_then(|h| h.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    // special_type defaults to "default" if not provided
-    let special_type = body
-        .get("special_type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("default")
-        .to_string();
-
-    match &state.hash_store {
-        Some(HashStoreClient::Redis(client)) => {
-            for h in &hashes {
-                let _: Result<i64, _> = client.sadd("special_hashes", h.as_str()).await;
-            }
-        }
-        Some(HashStoreClient::Mongo(col)) => {
-            if !hashes.is_empty() {
-                for h in &hashes {
-                    let filter = doc! { "_id": h };
-                    let update = doc! { "$set": { "_id": h, "special_type": &special_type } };
-                    let opts = mongodb::options::UpdateOptions::builder()
-                        .upsert(true)
-                        .build();
-                    let _ = col.update_one(filter, update, opts).await;
-                }
-            }
-        }
-        None => {}
-    }
-    load_special_hashes(&state).await;
-    Json(json!({"added": hashes, "special_type": special_type})).into_response()
-}
-
 async fn dl(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -1201,10 +953,10 @@ async fn dl(
     headers: HeaderMap,
 ) -> Response {
     let ip = addr.ip().to_string();
-    let special_type = state.special_hashes.get(&hash).map(|v| v.clone());
 
-    if let Some(ref stype) = special_type {
-        return handle_special_redirect(&state, stype).await;
+    // Special hash check: redirect before any other logic
+    if let Some(stype) = state.special_hashes.get(&hash).map(|v| v.clone()) {
+        return handle_special_redirect(&state, &stype).await;
     }
 
     if referer_blocked(&state, &headers, &ip).await {
@@ -1222,13 +974,18 @@ async fn dl(
     match get_best_cdn(&state).await {
         Some(cdn) => {
             let target = format!("{}/dl/{}/{}", cdn, hash, filename);
-            // Build redirect with configurable status code (307 default)
-            axum::http::Response::builder()
+            match axum::http::Response::builder()
                 .status(state.config.redirect_code)
                 .header(header::LOCATION, &target)
                 .body(Body::empty())
-                .unwrap()
-                .into_response()
+            {
+                Ok(r) => r.into_response(),
+                Err(_) => (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({"error": "invalid redirect URL"})),
+                )
+                    .into_response(),
+            }
         }
         None => (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1245,10 +1002,10 @@ async fn watch(
     headers: HeaderMap,
 ) -> Response {
     let ip = addr.ip().to_string();
-    let special_type = state.special_hashes.get(&hash).map(|v| v.clone());
 
-    if let Some(ref stype) = special_type {
-        return handle_special_redirect(&state, stype).await;
+    // Special hash check: redirect before any other logic
+    if let Some(stype) = state.special_hashes.get(&hash).map(|v| v.clone()) {
+        return handle_special_redirect(&state, &stype).await;
     }
 
     if referer_blocked(&state, &headers, &ip).await {
@@ -1307,19 +1064,57 @@ async fn stats(State(state): State<AppState>, headers: HeaderMap) -> Response {
         v
     };
     let best = get_best_cdn(&state).await;
-    let specials: Vec<Value> = state
-        .special_hashes
-        .iter()
-        .map(|e| json!({"hash": e.key(), "special_type": e.value()}))
-        .collect();
 
     Json(json!({
         "cdns": cdn_list,
         "trusted_hosts": trusted,
         "best_cdn": best,
-        "special_hashes": specials,
     }))
     .into_response()
+}
+
+// ============================================================
+// ADD SPECIAL HASH  (MongoDB only)
+// ============================================================
+
+async fn add_special(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Json(body): axum::extract::Json<Value>,
+) -> Response {
+    if let Err(e) = check_admin(&headers, &state.config) {
+        return e;
+    }
+
+    let hashes: Vec<String> = body
+        .get("hashes")
+        .and_then(|h| h.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
+
+    let special_type = body
+        .get("special_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("zero_ad")
+        .to_string();
+
+    if let Some(col) = &state.mongo_col {
+        for h in &hashes {
+            let filter = doc! { "_id": h };
+            let update = doc! { "$set": { "_id": h, "special_type": &special_type } };
+            let opts = mongodb::options::UpdateOptions::builder().upsert(true).build();
+            if let Err(e) = col.update_one(filter, update, opts).await {
+                debug!("MongoDB upsert error for hash {}: {}", h, e);
+            }
+        }
+    }
+
+    // Insert directly into in-memory cache – no full reload needed
+    for h in &hashes {
+        state.special_hashes.insert(h.clone(), special_type.clone());
+    }
+
+    Json(json!({"added": hashes, "special_type": special_type})).into_response()
 }
 
 // ============================================================
@@ -1339,6 +1134,17 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = Arc::new(Config::from_env());
+
+    // Validate required env vars – fail fast with a clear error message
+    if config.admin_key.is_empty() {
+        anyhow::bail!("LB_ADMIN_KEY env var is required but not set");
+    }
+    if config.tg_redirect.is_empty() {
+        anyhow::bail!("REDIRECT_TO env var is required but not set");
+    }
+    if config.arolinks_api.is_none() {
+        tracing::warn!("AROLINKS_API_TOKEN not set – one_ad and two_ad will fall back to direct Telegram redirect");
+    }
 
     // ── Bind TCP listener EARLY so health checks pass during slow init ──
     let port: u16 = std::env::var("PORT")
@@ -1368,48 +1174,34 @@ async fn main() -> anyhow::Result<()> {
         db
     };
 
-    // ── Hash store: MongoDB (MONGO_URL) takes priority over Redis (REDIS_URL) ──
-    let hash_store: Option<HashStoreClient> =
-        if let Ok(mongo_url) = std::env::var("MONGO_URL") {
-            let mongo_client = mongodb::Client::with_uri_str(&mongo_url).await?;
-            // Database name is required via MONGO_DB_NAME
-            let db_name = std::env::var("MONGO_DB_NAME")
-                .unwrap_or_else(|_| "loadbalancer".to_string());
-            // Collection name is required via MONGO_DB_COLLECTION_NAME
-            let col_name = std::env::var("MONGO_DB_COLLECTION_NAME")
-                .unwrap_or_else(|_| "special_hashes".to_string());
-            let col = mongo_client
-                .database(&db_name)
-                .collection::<mongodb::bson::Document>(&col_name);
-            tracing::info!(
-                "Connected to MongoDB (db={}, collection={}) for special hashes",
-                db_name,
-                col_name
-            );
-            Some(HashStoreClient::Mongo(col))
-        } else if let Ok(url) = std::env::var("REDIS_URL") {
-            // fred v9: RedisConfig::from_url (Config alias was removed in v9)
-            let config = RedisConfig::from_url(&url)?;
-            let client = Builder::from_config(config).build()?;
-            // init() drives the connection; TLS is auto-detected from rediss:// URL
-            client.init().await?;
-            tracing::info!("Connected to Redis for special hashes");
-            Some(HashStoreClient::Redis(client))
-        } else {
-            tracing::warn!("No MONGO_URL or REDIS_URL set – special hashes will not persist");
-            None
-        };
-
     // ── HTTP client (no global timeout – set per-request) ──────
     let http_client = reqwest::Client::builder()
         .user_agent("loadbalancer-rs/1.0")
         .build()?;
 
+    // MongoDB for special hashes – all three env vars are required when MONGO_URL is set
+    let mongo_col: Option<mongodb::Collection<mongodb::bson::Document>> =
+        if let Ok(mongo_url) = std::env::var("MONGO_URL") {
+            let db_name = std::env::var("MONGO_DB_NAME")
+                .map_err(|_| anyhow::anyhow!("MONGO_DB_NAME env var is required when MONGO_URL is set"))?;
+            let col_name = std::env::var("MONGO_DB_COLLECTION_NAME")
+                .map_err(|_| anyhow::anyhow!("MONGO_DB_COLLECTION_NAME env var is required when MONGO_URL is set"))?;
+            let mongo_client = mongodb::Client::with_uri_str(&mongo_url).await?;
+            let col = mongo_client
+                .database(&db_name)
+                .collection::<mongodb::bson::Document>(&col_name);
+            tracing::info!("Connected to MongoDB ({}.{}) for special hashes", db_name, col_name);
+            Some(col)
+        } else {
+            tracing::warn!("MONGO_URL not set – special hashes disabled");
+            None
+        };
+
     // ── Build shared state ─────────────────────────────────────
     let state = AppState {
         lmdb_env: env,
         lmdb_db,
-        hash_store,
+        mongo_col,
         special_hashes: Arc::new(DashMap::new()),
         best_cdn: Arc::new(RwLock::new(BestCdnCache::default())),
         rate_limiter: Arc::new(DashMap::new()),
@@ -1444,14 +1236,16 @@ async fn main() -> anyhow::Result<()> {
 
     rebuild_trusted_hosts(&state).await;
 
-    // ── Background: load special hashes once on startup ───────
-    // Runs in the background so a slow / unreachable MongoDB or Redis does NOT
-    // block axum::serve() from starting.  After startup, hashes are only
-    // refreshed from the database when the admin clicks Refresh in the dashboard.
+    // Load special hashes from MongoDB on startup (non-blocking),
+    // then re-sync every 5 minutes to pick up changes made by external apps.
     {
         let s = state.clone();
         tokio::spawn(async move {
             load_special_hashes(&s).await;
+            loop {
+                tokio::time::sleep(Duration::from_secs(1800)).await;
+                load_special_hashes(&s).await;
+            }
         });
     }
 
@@ -1475,14 +1269,11 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/health", get(health))
         .route("/nitai", get(nitai))
-        .route("/nitai/hashes", get(nitai_hashes))
         .route("/add_cdn", post(add_cdn))
         .route("/add_special", post(add_special))
         .route("/dl/:hash/*filename", get(dl))
         .route("/watch/:hash/*filename", get(watch))
         .route("/stats", get(stats))
-        .route("/refresh_special_hashes", post(refresh_special_hashes))
-        .route("/special_hashes_by_type", get(special_hashes_by_type))
         .with_state(state);
 
     axum::serve(
