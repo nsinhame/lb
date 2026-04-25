@@ -539,6 +539,8 @@ async fn nitai() -> impl IntoResponse {
   .empty{color:#4a5568;font-style:italic;font-size:.85rem;padding:12px 0}
   .trusted-list{display:flex;flex-wrap:wrap;gap:6px;margin-top:4px}
   .trusted-chip{background:#1a365d;color:#90cdf4;border-radius:6px;padding:3px 10px;font-size:.78rem;font-family:monospace}
+  .cdn-link{display:block;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#63b3ed;text-decoration:none;cursor:pointer}
+  .cdn-link:hover{text-decoration:underline;color:#90cdf4}
   @media(max-width:600px){main{padding:16px};header{padding:16px}}
 </style>
 </head>
@@ -672,7 +674,7 @@ function render(data) {
       const bw = loadBarWidth(c.load);
       const loadDisp = c.load >= 99999 ? '∞' : c.load;
       return `<tr>
-        <td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><a href="${c.url}/status" target="_blank" rel="noopener" style="color:#63b3ed;text-decoration:none" title="${c.url}/status">${host}</a></td>
+        <td><a href="${c.url}/status" target="_blank" rel="noopener" class="cdn-link" title="${c.url}/status">${host}</a></td>
         <td><span class="badge ${c.last_ok === 1 ? 'online' : 'offline'}">${c.last_ok === 1 ? 'Online' : 'Offline'}</span>${c.last_ok !== 1 && c.error_code ? `<br><span style="font-size:.75rem;color:#fc8181">${c.error_code}</span>` : ''}</td>
         <td>${loadDisp}</td>
         <td><div class="load-bar-wrap"><div class="load-bar ${lc}" style="width:${bw}%"></div></div></td>
