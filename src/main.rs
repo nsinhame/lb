@@ -57,7 +57,7 @@ impl Config {
         let poll_interval: u64 = std::env::var("LB_POLL_INTERVAL")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(5);
+            .unwrap_or(30);
 
         // Same formula as Python: math.ceil((5 * 60) / POLL_INTERVAL)
         let fail_threshold = (((5 * 60) as f64) / poll_interval as f64).ceil() as u64;
