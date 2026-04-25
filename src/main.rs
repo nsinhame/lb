@@ -670,11 +670,12 @@ function render(data) {
   } else {
     tbody.innerHTML = cdns.map(c => {
       const host = (() => { try { return new URL(c.url).hostname; } catch(e) { return c.url; }})();
+      const statusUrl = (c.url.startsWith('http') ? c.url : 'https://' + c.url) + '/status';
       const lc = loadColor(c.load);
       const bw = loadBarWidth(c.load);
       const loadDisp = c.load >= 99999 ? '∞' : c.load;
       return `<tr>
-        <td><a href="${c.url}/status" target="_blank" rel="noopener" class="cdn-link" title="${c.url}/status">${host}</a></td>
+        <td onclick="window.open('${statusUrl}','_blank')" style="cursor:pointer;color:#63b3ed;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${statusUrl}">${host} ↗</td>
         <td><span class="badge ${c.last_ok === 1 ? 'online' : 'offline'}">${c.last_ok === 1 ? 'Online' : 'Offline'}</span>${c.last_ok !== 1 && c.error_code ? `<br><span style="font-size:.75rem;color:#fc8181">${c.error_code}</span>` : ''}</td>
         <td>${loadDisp}</td>
         <td><div class="load-bar-wrap"><div class="load-bar ${lc}" style="width:${bw}%"></div></div></td>
