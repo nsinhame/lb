@@ -708,11 +708,15 @@ refresh();
 
 fn fix_video_src(html: &str, hash: &str, filename: &str) -> String {
     let escaped = regex::escape(hash);
-    // Match /dl/<hash> NOT followed by /  (idempotent)
-    let pattern = format!(r"/dl/{}(?!/)", escaped);
+    // The `regex` crate does not support lookaheads, so we use a capture group
+    // instead: match /dl/<hash> followed by any non-slash character and capture
+    // that character so we can put it back in the replacement.
+    // This is idempotent: /dl/<hash>/<filename> won't match because the char
+    // immediately after <hash> is '/', which is excluded by [^/].
+    let pattern = format!(r"/dl/{}([^/])", escaped);
     match Regex::new(&pattern) {
         Ok(re) => re
-            .replace_all(html, format!("/dl/{}/{}", hash, filename).as_str())
+            .replace_all(html, format!("/dl/{}/{}$1", hash, filename).as_str())
             .into_owned(),
         Err(_) => html.to_string(),
     }
