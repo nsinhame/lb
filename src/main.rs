@@ -155,6 +155,8 @@ struct AppState {
     lmdb_db: CdnDb,
     /// MongoDB collection for special hashes (None if MONGO_URL not set)
     mongo_col: Option<mongodb::Collection<mongodb::bson::Document>>,
+    /// MongoDB collection for CDN registry persistence (None if MONGO_URL not set)
+    mongo_cdn_col: Option<mongodb::Collection<mongodb::bson::Document>>,
     /// key = file hash, value = special_type ("zero_ad", "one_ad", "two_ad", …)
     special_hashes: Arc<DashMap<String, String>>,
     best_cdn: Arc<RwLock<BestCdnCache>>,
@@ -303,8 +305,32 @@ async fn load_special_hashes(state: &AppState) {
 }
 
 // ============================================================
+// CDN REGISTRY PERSISTENCE  (MongoDB cdn_registry collection)
+// ============================================================
+
+/// Upsert a CDN URL into the MongoDB cdn_registry collection.
+async fn mongo_add_cdn(state: &AppState, url: &str) {
+    let Some(col) = &state.mongo_cdn_col else { return };
+    let filter = doc! { "_id": url };
+    let update = doc! { "$setOnInsert": { "_id": url } };
+    let opts = mongodb::options::UpdateOptions::builder().upsert(true).build();
+    if let Err(e) = col.update_one(filter, update, opts).await {
+        tracing::warn!("MongoDB cdn_registry upsert error for {}: {}", url, e);
+    }
+}
+
+/// Remove a CDN URL from the MongoDB cdn_registry collection.
+async fn mongo_remove_cdn(state: &AppState, url: &str) {
+    let Some(col) = &state.mongo_cdn_col else { return };
+    if let Err(e) = col.delete_one(doc! { "_id": url }, None).await {
+        tracing::warn!("MongoDB cdn_registry delete error for {}: {}", url, e);
+    }
+}
+
+// ============================================================
 // CDN SELECTION
 // ============================================================
+
 
 async fn get_best_cdn(state: &AppState) -> Option<String> {
     // Return cached value if still fresh
@@ -824,6 +850,7 @@ async fn poller_task(state: AppState) {
                 let fail_count = prev_fail + 1;
                 if fail_count >= state.config.fail_threshold {
                     debug!("Purging dead CDN: {}", url);
+                    mongo_remove_cdn(&state, &url).await;
                     lmdb_delete_cdn(&state, url).await;
                 } else {
                     lmdb_set_cdn(
@@ -996,6 +1023,7 @@ async fn add_cdn(
                         },
                     )
                     .await;
+                    mongo_add_cdn(&state, &url).await;
                     added.push(url);
                 }
             }
@@ -1283,29 +1311,33 @@ async fn main() -> anyhow::Result<()> {
         .user_agent("loadbalancer-rs/1.0")
         .build()?;
 
-    // MongoDB for special hashes – all three env vars are required when MONGO_URL is set
-    let mongo_col: Option<mongodb::Collection<mongodb::bson::Document>> =
-        if let Ok(mongo_url) = std::env::var("MONGO_URL") {
-            let db_name = std::env::var("MONGO_DB_NAME")
-                .map_err(|_| anyhow::anyhow!("MONGO_DB_NAME env var is required when MONGO_URL is set"))?;
-            let col_name = std::env::var("MONGO_DB_COLLECTION_NAME")
-                .map_err(|_| anyhow::anyhow!("MONGO_DB_COLLECTION_NAME env var is required when MONGO_URL is set"))?;
-            let mongo_client = mongodb::Client::with_uri_str(&mongo_url).await?;
-            let col = mongo_client
-                .database(&db_name)
-                .collection::<mongodb::bson::Document>(&col_name);
-            tracing::info!("Connected to MongoDB ({}.{}) for special hashes", db_name, col_name);
-            Some(col)
-        } else {
-            tracing::warn!("MONGO_URL not set – special hashes disabled");
-            None
-        };
+    // MongoDB for special hashes and CDN persistence – MONGO_URL triggers both
+    let (mongo_col, mongo_cdn_col): (
+        Option<mongodb::Collection<mongodb::bson::Document>>,
+        Option<mongodb::Collection<mongodb::bson::Document>>,
+    ) = if let Ok(mongo_url) = std::env::var("MONGO_URL") {
+        let db_name = std::env::var("MONGO_DB_NAME")
+            .map_err(|_| anyhow::anyhow!("MONGO_DB_NAME env var is required when MONGO_URL is set"))?;
+        let col_name = std::env::var("MONGO_DB_COLLECTION_NAME")
+            .map_err(|_| anyhow::anyhow!("MONGO_DB_COLLECTION_NAME env var is required when MONGO_URL is set"))?;
+        let mongo_client = mongodb::Client::with_uri_str(&mongo_url).await?;
+        let db = mongo_client.database(&db_name);
+        let special_col = db.collection::<mongodb::bson::Document>(&col_name);
+        let cdn_col = db.collection::<mongodb::bson::Document>("cdn_registry");
+        tracing::info!("Connected to MongoDB ({}.{}) for special hashes", db_name, col_name);
+        tracing::info!("Using MongoDB cdn_registry collection for CDN persistence");
+        (Some(special_col), Some(cdn_col))
+    } else {
+        tracing::warn!("MONGO_URL not set – special hashes and CDN persistence disabled");
+        (None, None)
+    };
 
     // ── Build shared state ─────────────────────────────────────
     let state = AppState {
         lmdb_env: env,
         lmdb_db,
         mongo_col,
+        mongo_cdn_col,
         special_hashes: Arc::new(DashMap::new()),
         best_cdn: Arc::new(RwLock::new(BestCdnCache::default())),
         rate_limiter: Arc::new(DashMap::new()),
@@ -1318,6 +1350,42 @@ async fn main() -> anyhow::Result<()> {
         http_client,
     };
 
+    // ── Load persisted CDNs from MongoDB cdn_registry ──────────
+    if let Some(ref cdn_col) = state.mongo_cdn_col {
+        match cdn_col.find(None, None).await {
+            Ok(mut cursor) => {
+                let mut loaded = 0usize;
+                loop {
+                    match cursor.advance().await {
+                        Ok(true) => {
+                            if let Ok(doc) = cursor.deserialize_current() {
+                                if let Ok(url) = doc.get_str("_id").map(|s| s.to_string()) {
+                                    if url.starts_with("http") && lmdb_get_cdn(&state, url.clone()).await.is_none() {
+                                        lmdb_set_cdn(
+                                            &state,
+                                            url,
+                                            CdnMeta {
+                                                load: 99999,
+                                                last_ok: 0,
+                                                fail_count: 0,
+                                                ..Default::default()
+                                            },
+                                        )
+                                        .await;
+                                        loaded += 1;
+                                    }
+                                }
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+                tracing::info!("Loaded {} CDN(s) from MongoDB cdn_registry", loaded);
+            }
+            Err(e) => tracing::error!("MongoDB error loading cdn_registry: {}", e),
+        }
+    }
+
     // ── Seed CDNs from LB_CDN_URLS env var ────────────────────
     if let Ok(env_cdns) = std::env::var("LB_CDN_URLS") {
         for raw in env_cdns.split(',') {
@@ -1325,7 +1393,7 @@ async fn main() -> anyhow::Result<()> {
             if u.starts_with("http") && lmdb_get_cdn(&state, u.clone()).await.is_none() {
                 lmdb_set_cdn(
                     &state,
-                    u,
+                    u.clone(),
                     CdnMeta {
                         load: 99999,
                         last_ok: 0,
@@ -1334,6 +1402,7 @@ async fn main() -> anyhow::Result<()> {
                     },
                 )
                 .await;
+                mongo_add_cdn(&state, &u).await;
             }
         }
     }
