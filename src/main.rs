@@ -865,6 +865,9 @@ async fn stream_upstream(
     filename: &str,
 ) -> Result<Response, StatusCode> {
     req_headers.remove(header::HOST);
+    // Remove Accept-Encoding so the CDN returns uncompressed HTML we can parse and rewrite.
+    // Without this, the CDN may return gzip-encoded bytes that look like garbage to fix_video_src.
+    req_headers.remove(header::ACCEPT_ENCODING);
 
     let resp = client
         .get(upstream_url)
@@ -882,6 +885,24 @@ async fn stream_upstream(
         .unwrap_or("")
         .to_string();
 
+    // Hop-by-hop headers must NOT be forwarded to the client.
+    // Forwarding Transfer-Encoding: chunked causes double-encoding: reqwest already
+    // decodes the upstream chunking, so axum/hyper applies its own chunking on top.
+    // Envoy then sees a malformed body and resets the connection before sending headers.
+    let is_hop_by_hop = |name: &str| {
+        matches!(
+            name,
+            "connection"
+                | "keep-alive"
+                | "transfer-encoding"
+                | "te"
+                | "trailers"
+                | "upgrade"
+                | "proxy-authenticate"
+                | "proxy-authorization"
+        )
+    };
+
     if content_type.contains("text/html") {
         // Buffer the HTML, rewrite video src, then send
         let body_bytes = resp
@@ -890,13 +911,22 @@ async fn stream_upstream(
             .map_err(|_| StatusCode::BAD_GATEWAY)?;
         let html = String::from_utf8_lossy(&body_bytes);
         let fixed = fix_video_src(&html, hash, filename);
+        let fixed_bytes = fixed.into_bytes();
 
         let mut builder = axum::http::Response::builder().status(upstream_status);
         for (k, v) in &upstream_headers {
+            let name = k.as_str().to_lowercase();
+            // Skip hop-by-hop headers AND Content-Length: the body changed after
+            // fix_video_src, so the upstream length is now wrong.
+            if name == "content-length" || is_hop_by_hop(&name) {
+                continue;
+            }
             builder = builder.header(k, v);
         }
+        // Set correct Content-Length for the rewritten body.
+        builder = builder.header(header::CONTENT_LENGTH, fixed_bytes.len());
         Ok(builder
-            .body(Body::from(fixed))
+            .body(Body::from(fixed_bytes))
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()))
     } else {
         // Stream bytes directly to the client without buffering
@@ -905,6 +935,10 @@ async fn stream_upstream(
 
         let mut builder = axum::http::Response::builder().status(upstream_status);
         for (k, v) in &upstream_headers {
+            let name = k.as_str().to_lowercase();
+            if is_hop_by_hop(&name) {
+                continue;
+            }
             builder = builder.header(k, v);
         }
         Ok(builder
