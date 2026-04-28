@@ -1206,47 +1206,21 @@ async fn stats(State(state): State<AppState>, headers: HeaderMap) -> Response {
 }
 
 // ============================================================
-// ADD SPECIAL HASH  (MongoDB only)
+// RELOAD SPECIAL HASHES  (admin-only, triggered by external backend)
 // ============================================================
 
-async fn add_special(
+async fn reload_special(
     State(state): State<AppState>,
     headers: HeaderMap,
-    axum::extract::Json(body): axum::extract::Json<Value>,
 ) -> Response {
     if let Err(e) = check_admin(&headers, &state.config) {
         return e;
     }
-
-    let hashes: Vec<String> = body
-        .get("hashes")
-        .and_then(|h| h.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
-        .unwrap_or_default();
-
-    let special_type = body
-        .get("special_type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("zero_ad")
-        .to_string();
-
-    if let Some(col) = &state.mongo_col {
-        for h in &hashes {
-            let filter = doc! { "_id": h };
-            let update = doc! { "$set": { "_id": h, "special_type": &special_type } };
-            let opts = mongodb::options::UpdateOptions::builder().upsert(true).build();
-            if let Err(e) = col.update_one(filter, update, opts).await {
-                debug!("MongoDB upsert error for hash {}: {}", h, e);
-            }
-        }
-    }
-
-    // Insert directly into in-memory cache – no full reload needed
-    for h in &hashes {
-        state.special_hashes.insert(h.clone(), special_type.clone());
-    }
-
-    Json(json!({"added": hashes, "special_type": special_type})).into_response()
+    load_special_hashes(&state).await;
+    Json(json!({
+        "reloaded": true,
+        "count": state.special_hashes.len()
+    })).into_response()
 }
 
 // ============================================================
@@ -1443,7 +1417,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(health))
         .route("/nitai", get(nitai))
         .route("/add_cdn", post(add_cdn))
-        .route("/add_special", post(add_special))
+        .route("/reload_special", post(reload_special))
         .route("/dl/:hash/*filename", get(dl))
         .route("/watch/:hash/*filename", get(watch))
         .route("/stats", get(stats))
