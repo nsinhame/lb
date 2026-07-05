@@ -44,6 +44,12 @@ const AD_INTERVAL_SECS: f64 = 2.0 * 24.0 * 60.0 * 60.0;
 /// round-trip). After this it is rejected, preventing indefinite replay.
 const AD_TOKEN_TTL_SECS: u64 = 60 * 60; // 1 hour
 
+/// /ad-tokens "purchase" flow: users pre-watch ads to bank ad-free time.
+/// Each ad grants 12h; users are blocked once they are banked > 1 day ahead
+/// (so at most ~2 ads/day worth of ad-free time can be accumulated).
+const ONE_DAY_SECS: f64 = 24.0 * 60.0 * 60.0;
+const TWELVE_HOURS_SECS: f64 = 12.0 * 60.0 * 60.0;
+
 type HmacSha256 = Hmac<Sha256>;
 
 // ============================================================
@@ -445,6 +451,39 @@ async fn update_ad_watch_time(state: &AppState, hash: &str) {
     }
 }
 
+/// Read a user's ad_watch_time directly by `id`. Returns:
+///   Some(Some(t)) = user found with ad_watch_time,
+///   Some(None)    = user found without it, or user not found,
+///   None          = users collection unavailable / query failed.
+async fn user_ad_watch_time_by_id(state: &AppState, user_id: i64) -> Option<Option<f64>> {
+    let users = state.mongo_users_col.as_ref()?;
+    match users.find_one(doc! { "id": user_id }, None).await {
+        Ok(Some(user_doc)) => Some(bson_to_f64(user_doc.get("ad_watch_time"))),
+        Ok(None) => Some(None),
+        Err(e) => {
+            tracing::warn!("users lookup error for id {}: {}", user_id, e);
+            None
+        }
+    }
+}
+
+/// Set a user's ad_watch_time to an absolute value (upserts the user doc).
+async fn set_ad_watch_time(state: &AppState, user_id: i64, value: f64) -> bool {
+    let Some(users) = state.mongo_users_col.as_ref() else {
+        return false;
+    };
+    let filter = doc! { "id": user_id };
+    let update = doc! { "$set": { "ad_watch_time": value } };
+    let opts = mongodb::options::UpdateOptions::builder().upsert(true).build();
+    match users.update_one(filter, update, opts).await {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::warn!("Failed to set ad_watch_time for user {}: {}", user_id, e);
+            false
+        }
+    }
+}
+
 // ============================================================
 // CDN SELECTION
 // ============================================================
@@ -648,20 +687,49 @@ async fn handle_special_redirect(state: &AppState, special_type: &str) -> Respon
 // AROLINKS AD REDIRECT HELPERS
 // ============================================================
 
-/// Canonical string that the ad-callback signature is computed over. Binding the
-/// kind, hash, filename and expiry means a token is valid only for that exact link.
+/// Low-level: hex-encoded HMAC-SHA256 of `message` under `secret`.
+fn hmac_hex(secret: &str, message: &str) -> String {
+    let mut mac =
+        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts keys of any size");
+    mac.update(message.as_bytes());
+    hex::encode(mac.finalize().into_bytes())
+}
+
+/// Low-level: constant-time check that `sig_hex` is a valid HMAC of `message`.
+fn hmac_verify(secret: &str, message: &str, sig_hex: &str) -> bool {
+    let Ok(sig_bytes) = hex::decode(sig_hex) else {
+        return false;
+    };
+    let Ok(mut mac) = HmacSha256::new_from_slice(secret.as_bytes()) else {
+        return false;
+    };
+    mac.update(message.as_bytes());
+    mac.verify_slice(&sig_bytes).is_ok()
+}
+
+/// Split a `<exp>-<sig>` token, rejecting it if the expiry has already passed.
+fn parse_signed_token(token: &str) -> Option<(u64, &str)> {
+    let (exp_str, sig_hex) = token.split_once('-')?;
+    let exp = exp_str.parse::<u64>().ok()?;
+    if now_unix() > exp {
+        return None; // expired
+    }
+    Some((exp, sig_hex))
+}
+
+/// Canonical string the /dl and /watch ad-callback signature is computed over.
+/// Binding kind, hash, filename and expiry means a token is valid only for that link.
 fn ad_token_canonical(kind: LinkKind, hash: &str, filename: &str, exp: u64) -> String {
     format!("{}:{}:{}:{}", kind.path(), hash, filename, exp)
 }
 
-/// Produce a tamper-proof callback token `<exp>-<hex hmac-sha256>`. Only the
-/// server, which holds the secret, can generate a token that will later verify.
+/// Produce a tamper-proof /dl|/watch callback token `<exp>-<hex hmac-sha256>`.
 fn sign_ad_token(secret: &str, kind: LinkKind, hash: &str, filename: &str, exp: u64) -> String {
-    let mut mac =
-        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts keys of any size");
-    mac.update(ad_token_canonical(kind, hash, filename, exp).as_bytes());
-    let sig = mac.finalize().into_bytes();
-    format!("{}-{}", exp, hex::encode(sig))
+    format!(
+        "{}-{}",
+        exp,
+        hmac_hex(secret, &ad_token_canonical(kind, hash, filename, exp))
+    )
 }
 
 /// Cheap structural check: does this path segment look like an ad token
@@ -678,26 +746,32 @@ fn looks_like_ad_token(seg: &str) -> bool {
     }
 }
 
-/// Verify a callback token: the signature must match and it must not be expired.
-/// `verify_slice` performs a constant-time comparison to resist timing attacks.
+/// Verify a /dl|/watch callback token (signature match + not expired).
 fn verify_ad_token(secret: &str, kind: LinkKind, hash: &str, filename: &str, token: &str) -> bool {
-    let Some((exp_str, sig_hex)) = token.split_once('-') else {
-        return false;
-    };
-    let Ok(exp) = exp_str.parse::<u64>() else {
-        return false;
-    };
-    if now_unix() > exp {
-        return false; // expired
+    match parse_signed_token(token) {
+        Some((exp, sig_hex)) => {
+            hmac_verify(secret, &ad_token_canonical(kind, hash, filename, exp), sig_hex)
+        }
+        None => false,
     }
-    let Ok(sig_bytes) = hex::decode(sig_hex) else {
-        return false;
-    };
-    let Ok(mut mac) = HmacSha256::new_from_slice(secret.as_bytes()) else {
-        return false;
-    };
-    mac.update(ad_token_canonical(kind, hash, filename, exp).as_bytes());
-    mac.verify_slice(&sig_bytes).is_ok()
+}
+
+/// Canonical string for the /ad-tokens purchase callback (binds the user id).
+fn purchase_canonical(user_id: i64, exp: u64) -> String {
+    format!("ad-tokens:{}:{}", user_id, exp)
+}
+
+/// Produce a tamper-proof /ad-tokens callback token bound to `user_id`.
+fn sign_purchase_token(secret: &str, user_id: i64, exp: u64) -> String {
+    format!("{}-{}", exp, hmac_hex(secret, &purchase_canonical(user_id, exp)))
+}
+
+/// Verify an /ad-tokens callback token (signature match + not expired).
+fn verify_purchase_token(secret: &str, user_id: i64, token: &str) -> bool {
+    match parse_signed_token(token) {
+        Some((exp, sig_hex)) => hmac_verify(secret, &purchase_canonical(user_id, exp), sig_hex),
+        None => false,
+    }
 }
 
 /// Reconstruct the public base URL (scheme://host) the client originally hit,
@@ -1440,6 +1514,161 @@ async fn watch(
     handle_link(state, addr, LinkKind::Watch, hash, filename, headers).await
 }
 
+// ============================================================
+// AD-TOKEN PURCHASE FLOW  (/ad-tokens/<user_id>/<rand>[/<token>])
+// ============================================================
+
+/// Human-readable duration like "1 day 4 hours" or "8 hours 5 min".
+fn human_duration(secs: f64) -> String {
+    let secs = secs.max(0.0) as u64;
+    let days = secs / 86_400;
+    let hours = (secs % 86_400) / 3_600;
+    let mins = (secs % 3_600) / 60;
+    if days > 0 {
+        format!(
+            "{} day{} {} hour{}",
+            days,
+            if days == 1 { "" } else { "s" },
+            hours,
+            if hours == 1 { "" } else { "s" }
+        )
+    } else if hours > 0 {
+        format!(
+            "{} hour{} {} min",
+            hours,
+            if hours == 1 { "" } else { "s" },
+            mins
+        )
+    } else {
+        format!("{} min", mins)
+    }
+}
+
+/// Render a simple dark-themed message page.
+fn message_page(emoji: &str, title: &str, message: &str, accent: &str) -> Response {
+    let html = format!(
+        r#"<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>{title}</title><style>*{{box-sizing:border-box;margin:0;padding:0}}body{{font-family:'Segoe UI',system-ui,sans-serif;background:#0f1117;color:#e2e8f0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}}.card{{background:#1a1f2e;border:1px solid #2d3748;border-radius:16px;padding:40px 32px;max-width:440px;text-align:center;box-shadow:0 10px 40px rgba(0,0,0,.4)}}.emoji{{font-size:3rem;margin-bottom:16px}}h1{{font-size:1.4rem;color:{accent};margin-bottom:12px}}p{{color:#a0aec0;font-size:1rem;line-height:1.6}}</style></head><body><div class="card"><div class="emoji">{emoji}</div><h1>{title}</h1><p>{message}</p></div></body></html>"#
+    );
+    Html(html).into_response()
+}
+
+fn ad_token_active_page(remaining: f64) -> Response {
+    message_page(
+        "\u{2705}",
+        "You're already covered",
+        &format!(
+            "You already have an active ad-free token. No ads will be shown for about {}.",
+            human_duration(remaining)
+        ),
+        "#68d391",
+    )
+}
+
+fn ad_token_incremented_page(remaining: f64) -> Response {
+    message_page(
+        "\u{1F389}",
+        "Ad-free time extended",
+        &format!(
+            "Your ad-free token was extended by 12 hours. You now have about {} of ad-free access.",
+            human_duration(remaining)
+        ),
+        "#63b3ed",
+    )
+}
+
+fn ad_token_unavailable_page() -> Response {
+    message_page(
+        "\u{1F6E0}",
+        "Temporarily unavailable",
+        "The ad-token service is not available right now. Please try again later.",
+        "#f6ad55",
+    )
+}
+
+fn ad_token_invalid_page() -> Response {
+    message_page(
+        "\u{26A0}",
+        "Invalid link",
+        "This ad-token link is malformed.",
+        "#fc8181",
+    )
+}
+
+/// Send the user through an arolinks ad whose destination is the signed callback
+/// that grants the tokens. Falls back to the callback directly if arolinks is
+/// unavailable, so the flow still completes.
+async fn show_purchase_ad(state: &AppState, headers: &HeaderMap, user_id: i64, rand: &str) -> Response {
+    let exp = now_unix() + AD_TOKEN_TTL_SECS;
+    let token = sign_purchase_token(&state.config.ad_secret, user_id, exp);
+    let callback_path = format!("/ad-tokens/{}/{}/{}", user_id, rand, token);
+
+    if let Some(api) = state.config.arolinks_api.as_ref() {
+        if let Some(base) = public_base_url(headers) {
+            let callback_abs = format!("{}{}", base, callback_path);
+            if let Some(short) = arolinks_shorten(
+                &state.http_client,
+                api,
+                &state.config.arolinks_endpoint,
+                &callback_abs,
+            )
+            .await
+            {
+                return axum::response::Redirect::to(&short).into_response();
+            }
+        }
+    }
+    redirect_to(state, &callback_path)
+}
+
+/// GET /ad-tokens/:user_id/:rand — entry point users click to pre-watch an ad.
+async fn ad_tokens_entry(
+    State(state): State<AppState>,
+    Path((user_id_str, rand)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    let Ok(user_id) = user_id_str.parse::<i64>() else {
+        return ad_token_invalid_page();
+    };
+    let now = now_unix_f64();
+    match user_ad_watch_time_by_id(&state, user_id).await {
+        // Banked more than a day ahead already → no ad, just inform the user.
+        Some(Some(awt)) if awt - now > ONE_DAY_SECS => ad_token_active_page(awt - now),
+        // Eligible (awt in the past, within a day, missing, or user not found) → show ad.
+        Some(_) => show_purchase_ad(&state, &headers, user_id, &rand).await,
+        None => ad_token_unavailable_page(),
+    }
+}
+
+/// GET /ad-tokens/:user_id/:rand/:token — arolinks callback after the ad.
+async fn ad_tokens_callback(
+    State(state): State<AppState>,
+    Path((user_id_str, rand, token)): Path<(String, String, String)>,
+) -> Response {
+    let Ok(user_id) = user_id_str.parse::<i64>() else {
+        return ad_token_invalid_page();
+    };
+    // Only accept unexpired tokens this server signed for this user.
+    if !verify_purchase_token(&state.config.ad_secret, user_id, &token) {
+        // Stale / tampered → restart the flow so a fresh ad is watched.
+        return redirect_to(&state, &format!("/ad-tokens/{}/{}", user_id, rand));
+    }
+    let now = now_unix_f64();
+    match user_ad_watch_time_by_id(&state, user_id).await {
+        // Re-check the cap so a replayed callback can't push beyond ~1 day ahead.
+        Some(Some(awt)) if awt - now > ONE_DAY_SECS => ad_token_active_page(awt - now),
+        Some(existing) => {
+            // Extend from whichever is later: the stored ad_watch_time or now. This
+            // guarantees each ad adds usable time even if awt was in the past, so the
+            // token can never get "stuck" behind the current time.
+            let base = existing.unwrap_or(now).max(now);
+            let new_awt = base + TWELVE_HOURS_SECS;
+            set_ad_watch_time(&state, user_id, new_awt).await;
+            ad_token_incremented_page(new_awt - now)
+        }
+        None => ad_token_unavailable_page(),
+    }
+}
+
 async fn stats(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(e) = check_admin(&headers, &state.config) {
         return e;
@@ -1699,6 +1928,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/reload_special", post(reload_special))
         .route("/dl/:hash/*filename", get(dl))
         .route("/watch/:hash/*filename", get(watch))
+        .route("/ad-tokens/:user_id/:rand", get(ad_tokens_entry))
+        .route("/ad-tokens/:user_id/:rand/:token", get(ad_tokens_callback))
         .route("/stats", get(stats))
         .with_state(state);
 
