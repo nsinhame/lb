@@ -25,14 +25,26 @@ use axum::{
 use dashmap::DashMap;
 use dotenvy::dotenv;
 use heed::{Database, Env, EnvOpenOptions};
+use hmac::{Hmac, Mac};
 use rand::seq::SliceRandom;
 use mongodb::bson::doc;
 use regex::Regex;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::Sha256;
 use tokio::sync::RwLock;
 use tracing::debug;
+
+/// A user is shown ads again once their last ad is older than this window.
+/// Hard-coded to 2 days (in seconds) per product requirement.
+const AD_INTERVAL_SECS: f64 = 2.0 * 24.0 * 60.0 * 60.0;
+
+/// How long a signed ad-callback token stays valid (covers the arolinks
+/// round-trip). After this it is rejected, preventing indefinite replay.
+const AD_TOKEN_TTL_SECS: u64 = 60 * 60; // 1 hour
+
+type HmacSha256 = Hmac<Sha256>;
 
 // ============================================================
 // CONFIG
@@ -42,6 +54,8 @@ struct Config {
     arolinks_api: Option<String>,
     arolinks_endpoint: String,
     admin_key: String,
+    /// Secret used to HMAC-sign ad-callback tokens (falls back to admin_key).
+    ad_secret: String,
     tg_redirect: String,
     max_requests_per_ip: usize,
     ttl_seconds: u64,
@@ -62,10 +76,19 @@ impl Config {
         // Same formula as Python: math.ceil((5 * 60) / POLL_INTERVAL)
         let fail_threshold = (((5 * 60) as f64) / poll_interval as f64).ceil() as u64;
 
+        // Secret for signing ad-callback tokens. Falls back to the admin key so the
+        // feature works out-of-the-box; set LB_AD_SECRET for proper key separation.
+        let admin_key = std::env::var("LB_ADMIN_KEY").unwrap_or_default();
+        let ad_secret = std::env::var("LB_AD_SECRET")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| admin_key.clone());
+
         Config {
             arolinks_api: std::env::var("AROLINKS_API_TOKEN").ok(),
             arolinks_endpoint: "https://arolinks.com/api".to_string(),
-            admin_key: std::env::var("LB_ADMIN_KEY").unwrap_or_default(),
+            admin_key,
+            ad_secret,
             tg_redirect: std::env::var("REDIRECT_TO").unwrap_or_default(),
             max_requests_per_ip: std::env::var("LB_MAX_REQUESTS_PER_IP")
                 .ok()
@@ -153,10 +176,15 @@ impl Default for BestCdnCache {
 struct AppState {
     lmdb_env: Arc<Env>,
     lmdb_db: CdnDb,
-    /// MongoDB collection for special hashes (None if MONGO_URL not set)
+    /// MongoDB "file" collection: keyed by file `_id` (the URL hash). Holds
+    /// `special_type` for some files and the owner `user_id` used for ad gating.
+    /// (None if MONGO_URL not set)
     mongo_col: Option<mongodb::Collection<mongodb::bson::Document>>,
     /// MongoDB collection for CDN registry persistence (None if MONGO_URL not set)
     mongo_cdn_col: Option<mongodb::Collection<mongodb::bson::Document>>,
+    /// MongoDB "users" collection: docs keyed by `id` (= file's `user_id`) and
+    /// holding `ad_watch_time`. (None if MONGO_URL not set)
+    mongo_users_col: Option<mongodb::Collection<mongodb::bson::Document>>,
     /// key = file hash, value = special_type ("zero_ad", "one_ad", "two_ad", …)
     special_hashes: Arc<DashMap<String, String>>,
     best_cdn: Arc<RwLock<BestCdnCache>>,
@@ -324,6 +352,96 @@ async fn mongo_remove_cdn(state: &AppState, url: &str) {
     let Some(col) = &state.mongo_cdn_col else { return };
     if let Err(e) = col.delete_one(doc! { "_id": url }, None).await {
         tracing::warn!("MongoDB cdn_registry delete error for {}: {}", url, e);
+    }
+}
+
+// ============================================================
+// PER-USER AD GATING  (file collection → users collection)
+// ============================================================
+
+/// Current wall-clock time as fractional Unix seconds (e.g. 1783243342.2778153).
+fn now_unix_f64() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
+}
+
+/// Coerce a BSON value that may be Long/Int/Double/String into i64.
+fn bson_to_i64(v: Option<&mongodb::bson::Bson>) -> Option<i64> {
+    use mongodb::bson::Bson;
+    match v? {
+        Bson::Int64(n) => Some(*n),
+        Bson::Int32(n) => Some(*n as i64),
+        Bson::Double(f) => Some(*f as i64),
+        Bson::String(s) => s.parse().ok(),
+        _ => None,
+    }
+}
+
+/// Coerce a BSON value that may be Double/Long/Int/String into f64.
+fn bson_to_f64(v: Option<&mongodb::bson::Bson>) -> Option<f64> {
+    use mongodb::bson::Bson;
+    match v? {
+        Bson::Double(f) => Some(*f),
+        Bson::Int64(n) => Some(*n as f64),
+        Bson::Int32(n) => Some(*n as f64),
+        Bson::String(s) => s.parse().ok(),
+        _ => None,
+    }
+}
+
+/// Look up a file's owner `user_id` in the file collection, keyed by the URL hash
+/// (which is the document `_id` — an ObjectId hex, or a plain string fallback).
+async fn file_user_id(state: &AppState, hash: &str) -> Option<i64> {
+    let col = state.mongo_col.as_ref()?;
+    let filter = match mongodb::bson::oid::ObjectId::parse_str(hash) {
+        Ok(oid) => doc! { "_id": oid },
+        Err(_) => doc! { "_id": hash },
+    };
+    let file_doc = col.find_one(filter, None).await.ok()??;
+    bson_to_i64(file_doc.get("user_id"))
+}
+
+/// Decide whether the user who owns `hash` should be shown an ad.
+///
+/// Rules:
+///   * ad_watch_time older than AD_INTERVAL_SECS (2 days)  → show ads
+///   * ad_watch_time field missing on an existing user doc → show ads
+///   * user_id unresolvable / user doc missing / Mongo off → serve directly
+///     (loop-safe: guarantees the post-ad callback won't re-trigger ads)
+async fn should_show_ads(state: &AppState, hash: &str) -> bool {
+    let Some(users) = state.mongo_users_col.as_ref() else {
+        return false;
+    };
+    let Some(uid) = file_user_id(state, hash).await else {
+        return false;
+    };
+    match users.find_one(doc! { "id": uid }, None).await {
+        Ok(Some(user_doc)) => match bson_to_f64(user_doc.get("ad_watch_time")) {
+            Some(t) => (now_unix_f64() - t) > AD_INTERVAL_SECS,
+            None => true, // field absent → show ads
+        },
+        Ok(None) => false, // no user doc → serve (loop-safe)
+        Err(e) => {
+            tracing::warn!("users lookup error for id {}: {}", uid, e);
+            false
+        }
+    }
+}
+
+/// Record that the user who owns `hash` just watched an ad (ad_watch_time = now).
+async fn update_ad_watch_time(state: &AppState, hash: &str) {
+    let Some(users) = state.mongo_users_col.as_ref() else {
+        return;
+    };
+    let Some(uid) = file_user_id(state, hash).await else {
+        return;
+    };
+    let filter = doc! { "id": uid };
+    let update = doc! { "$set": { "ad_watch_time": now_unix_f64() } };
+    if let Err(e) = users.update_one(filter, update, None).await {
+        tracing::warn!("Failed to update ad_watch_time for user {}: {}", uid, e);
     }
 }
 
@@ -524,6 +642,103 @@ async fn handle_special_redirect(state: &AppState, special_type: &str) -> Respon
         // Unknown type – fall back to Telegram bot
         _ => axum::response::Redirect::to(&tg).into_response(),
     }
+}
+
+// ============================================================
+// AROLINKS AD REDIRECT HELPERS
+// ============================================================
+
+/// Canonical string that the ad-callback signature is computed over. Binding the
+/// kind, hash, filename and expiry means a token is valid only for that exact link.
+fn ad_token_canonical(kind: LinkKind, hash: &str, filename: &str, exp: u64) -> String {
+    format!("{}:{}:{}:{}", kind.path(), hash, filename, exp)
+}
+
+/// Produce a tamper-proof callback token `<exp>-<hex hmac-sha256>`. Only the
+/// server, which holds the secret, can generate a token that will later verify.
+fn sign_ad_token(secret: &str, kind: LinkKind, hash: &str, filename: &str, exp: u64) -> String {
+    let mut mac =
+        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts keys of any size");
+    mac.update(ad_token_canonical(kind, hash, filename, exp).as_bytes());
+    let sig = mac.finalize().into_bytes();
+    format!("{}-{}", exp, hex::encode(sig))
+}
+
+/// Cheap structural check: does this path segment look like an ad token
+/// (`<digits>-<64 hex chars>`)? Real filenames won't match this shape.
+fn looks_like_ad_token(seg: &str) -> bool {
+    match seg.split_once('-') {
+        Some((exp, sig)) => {
+            !exp.is_empty()
+                && exp.bytes().all(|b| b.is_ascii_digit())
+                && sig.len() == 64
+                && sig.bytes().all(|b| b.is_ascii_hexdigit())
+        }
+        None => false,
+    }
+}
+
+/// Verify a callback token: the signature must match and it must not be expired.
+/// `verify_slice` performs a constant-time comparison to resist timing attacks.
+fn verify_ad_token(secret: &str, kind: LinkKind, hash: &str, filename: &str, token: &str) -> bool {
+    let Some((exp_str, sig_hex)) = token.split_once('-') else {
+        return false;
+    };
+    let Ok(exp) = exp_str.parse::<u64>() else {
+        return false;
+    };
+    if now_unix() > exp {
+        return false; // expired
+    }
+    let Ok(sig_bytes) = hex::decode(sig_hex) else {
+        return false;
+    };
+    let Ok(mut mac) = HmacSha256::new_from_slice(secret.as_bytes()) else {
+        return false;
+    };
+    mac.update(ad_token_canonical(kind, hash, filename, exp).as_bytes());
+    mac.verify_slice(&sig_bytes).is_ok()
+}
+
+/// Reconstruct the public base URL (scheme://host) the client originally hit,
+/// so the arolinks destination points back at this load balancer.
+fn public_base_url(headers: &HeaderMap) -> Option<String> {
+    let host = headers
+        .get("x-forwarded-host")
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| headers.get(header::HOST).and_then(|v| v.to_str().ok()))
+        .filter(|h| !h.is_empty())?;
+    let proto = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("https");
+    Some(format!("{}://{}", proto, host))
+}
+
+/// Build an arolinks ad whose final destination is the LB callback URL
+/// `<base>/<kind>/<hash>/<token>/<filename>`.  Returns None when an ad cannot
+/// be built (arolinks unconfigured, Host missing, or the shorten call failed)
+/// so the caller can serve the content directly instead.
+async fn ad_redirect(
+    state: &AppState,
+    headers: &HeaderMap,
+    kind: LinkKind,
+    hash: &str,
+    filename: &str,
+) -> Option<Response> {
+    let api = state.config.arolinks_api.as_ref()?;
+    let base = public_base_url(headers)?;
+    let exp = now_unix() + AD_TOKEN_TTL_SECS;
+    let token = sign_ad_token(&state.config.ad_secret, kind, hash, filename, exp);
+    let callback = format!("{}/{}/{}/{}/{}", base, kind.path(), hash, token, filename);
+    let short = arolinks_shorten(
+        &state.http_client,
+        api,
+        &state.config.arolinks_endpoint,
+        &callback,
+    )
+    .await?;
+    Some(axum::response::Redirect::to(&short).into_response())
 }
 
 async fn nitai() -> impl IntoResponse {
@@ -1076,45 +1291,61 @@ async fn add_cdn(
     Json(json!({"added": added})).into_response()
 }
 
-async fn dl(
-    State(state): State<AppState>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    Path(HashFilePath { hash, filename }): Path<HashFilePath>,
-    headers: HeaderMap,
-) -> Response {
-    let ip = addr.ip().to_string();
+// ============================================================
+// LINK HANDLING  (shared by /dl and /watch)
+// ============================================================
 
-    // Special hash check: redirect before any other logic
-    if let Some(stype) = state.special_hashes.get(&hash).map(|v| v.clone()) {
-        return handle_special_redirect(&state, &stype).await;
+#[derive(Clone, Copy)]
+enum LinkKind {
+    Dl,
+    Watch,
+}
+
+impl LinkKind {
+    fn path(self) -> &'static str {
+        match self {
+            LinkKind::Dl => "dl",
+            LinkKind::Watch => "watch",
+        }
     }
+}
 
-    if referer_blocked(&state, &headers, &ip).await {
-        return handle_special_redirect(&state, "one_ad").await;
-    }
-
-    if record_ip(&state, &ip, &hash) > state.config.max_requests_per_ip {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(json!({"error": "IP limit exceeded"})),
+/// Build a redirect Response to a (relative or absolute) location.
+fn redirect_to(state: &AppState, location: &str) -> Response {
+    match axum::http::Response::builder()
+        .status(state.config.redirect_code)
+        .header(header::LOCATION, location)
+        .body(Body::empty())
+    {
+        Ok(r) => r.into_response(),
+        Err(_) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": "invalid redirect URL"})),
         )
-            .into_response();
+            .into_response(),
     }
+}
 
-    match get_best_cdn(&state).await {
+/// Redirect the client to the best CDN's /dl endpoint.
+async fn serve_dl(state: &AppState, hash: &str, filename: &str) -> Response {
+    match get_best_cdn(state).await {
+        Some(cdn) => redirect_to(state, &format!("{}/dl/{}/{}", cdn, hash, filename)),
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "No CDN online"})),
+        )
+            .into_response(),
+    }
+}
+
+/// Stream the best CDN's /watch endpoint back to the client (rewriting HTML).
+async fn serve_watch(state: &AppState, hash: &str, filename: &str, headers: HeaderMap) -> Response {
+    match get_best_cdn(state).await {
         Some(cdn) => {
-            let target = format!("{}/dl/{}/{}", cdn, hash, filename);
-            match axum::http::Response::builder()
-                .status(state.config.redirect_code)
-                .header(header::LOCATION, &target)
-                .body(Body::empty())
-            {
-                Ok(r) => r.into_response(),
-                Err(_) => (
-                    StatusCode::BAD_GATEWAY,
-                    Json(json!({"error": "invalid redirect URL"})),
-                )
-                    .into_response(),
+            let upstream_url = format!("{}/watch/{}/{}", cdn, hash, filename);
+            match stream_upstream(&state.http_client, &upstream_url, headers, hash, filename).await {
+                Ok(resp) => resp,
+                Err(status) => (status, Json(json!({"error": "upstream error"}))).into_response(),
             }
         }
         None => (
@@ -1125,23 +1356,57 @@ async fn dl(
     }
 }
 
-async fn watch(
-    State(state): State<AppState>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    Path(HashFilePath { hash, filename }): Path<HashFilePath>,
+/// Shared request pipeline for both /dl and /watch.
+async fn handle_link(
+    state: AppState,
+    addr: SocketAddr,
+    kind: LinkKind,
+    hash: String,
+    mut filename: String,
     headers: HeaderMap,
 ) -> Response {
     let ip = addr.ip().to_string();
 
-    // Special hash check: redirect before any other logic
+    // 0. Ad callback: the arolinks destination is /<kind>/<hash>/<token>/<filename>,
+    //    where <token> is an HMAC signature only this server can produce. A valid,
+    //    unexpired token proves the user really went through the ad flow, so we
+    //    record the watch time and redirect to the real link (which then serves
+    //    directly, since the freshly-set ad_watch_time is < 2 days old). A
+    //    token-shaped but invalid/expired segment is stripped so the request
+    //    re-gates (shows a fresh ad) instead of leaking it into the CDN path.
+    if let Some(slash) = filename.find('/') {
+        let seg = filename[..slash].to_string();
+        if looks_like_ad_token(&seg) {
+            let rest = filename[slash + 1..].to_string();
+            if verify_ad_token(&state.config.ad_secret, kind, &hash, &rest, &seg) {
+                update_ad_watch_time(&state, &hash).await;
+                return redirect_to(&state, &format!("/{}/{}/{}", kind.path(), hash, rest));
+            }
+            filename = rest;
+        }
+    }
+
+    // 1. Special hash → forced ad flow (unchanged).
     if let Some(stype) = state.special_hashes.get(&hash).map(|v| v.clone()) {
         return handle_special_redirect(&state, &stype).await;
     }
 
+    // 2. Referer blocking (unchanged).
     if referer_blocked(&state, &headers, &ip).await {
         return handle_special_redirect(&state, "one_ad").await;
     }
 
+    // 3. Per-user ad gate: show an ad if this file's owner hasn't watched one in
+    //    the last 2 days (or has no recorded ad_watch_time). Only meaningful when
+    //    arolinks is configured.
+    if state.config.arolinks_api.is_some() && should_show_ads(&state, &hash).await {
+        if let Some(resp) = ad_redirect(&state, &headers, kind, &hash, &filename).await {
+            return resp;
+        }
+        // Ad could not be built (no Host / shorten failed) → serve directly.
+    }
+
+    // 4. Rate limit (unchanged).
     if record_ip(&state, &ip, &hash) > state.config.max_requests_per_ip {
         return (
             StatusCode::TOO_MANY_REQUESTS,
@@ -1150,24 +1415,29 @@ async fn watch(
             .into_response();
     }
 
-    match get_best_cdn(&state).await {
-        Some(cdn) => {
-            let upstream_url = format!("{}/watch/{}/{}", cdn, hash, filename);
-            match stream_upstream(&state.http_client, &upstream_url, headers, &hash, &filename)
-                .await
-            {
-                Ok(resp) => resp,
-                Err(status) => {
-                    (status, Json(json!({"error": "upstream error"}))).into_response()
-                }
-            }
-        }
-        None => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": "No CDN online"})),
-        )
-            .into_response(),
+    // 5. Serve the content.
+    match kind {
+        LinkKind::Dl => serve_dl(&state, &hash, &filename).await,
+        LinkKind::Watch => serve_watch(&state, &hash, &filename, headers).await,
     }
+}
+
+async fn dl(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Path(HashFilePath { hash, filename }): Path<HashFilePath>,
+    headers: HeaderMap,
+) -> Response {
+    handle_link(state, addr, LinkKind::Dl, hash, filename, headers).await
+}
+
+async fn watch(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Path(HashFilePath { hash, filename }): Path<HashFilePath>,
+    headers: HeaderMap,
+) -> Response {
+    handle_link(state, addr, LinkKind::Watch, hash, filename, headers).await
 }
 
 async fn stats(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -1251,6 +1521,9 @@ async fn main() -> anyhow::Result<()> {
     if config.arolinks_api.is_none() {
         tracing::warn!("AROLINKS_API_TOKEN not set – one_ad and two_ad will fall back to direct Telegram redirect");
     }
+    if std::env::var("LB_AD_SECRET").ok().filter(|s| !s.is_empty()).is_none() {
+        tracing::warn!("LB_AD_SECRET not set – signing ad-callback tokens with LB_ADMIN_KEY (set LB_AD_SECRET for key separation)");
+    }
 
     // ── Bind TCP listener EARLY so health checks pass during slow init ──
     let port: u16 = std::env::var("PORT")
@@ -1285,8 +1558,9 @@ async fn main() -> anyhow::Result<()> {
         .user_agent("loadbalancer-rs/1.0")
         .build()?;
 
-    // MongoDB for special hashes and CDN persistence – MONGO_URL triggers both
-    let (mongo_col, mongo_cdn_col): (
+    // MongoDB for special hashes, CDN persistence, and per-user ad gating – MONGO_URL triggers all
+    let (mongo_col, mongo_cdn_col, mongo_users_col): (
+        Option<mongodb::Collection<mongodb::bson::Document>>,
         Option<mongodb::Collection<mongodb::bson::Document>>,
         Option<mongodb::Collection<mongodb::bson::Document>>,
     ) = if let Ok(mongo_url) = std::env::var("MONGO_URL") {
@@ -1294,16 +1568,20 @@ async fn main() -> anyhow::Result<()> {
             .map_err(|_| anyhow::anyhow!("MONGO_DB_NAME env var is required when MONGO_URL is set"))?;
         let col_name = std::env::var("MONGO_DB_COLLECTION_NAME")
             .map_err(|_| anyhow::anyhow!("MONGO_DB_COLLECTION_NAME env var is required when MONGO_URL is set"))?;
+        let users_col_name = std::env::var("MONGO_USERS_COLLECTION_NAME")
+            .unwrap_or_else(|_| "users".to_string());
         let mongo_client = mongodb::Client::with_uri_str(&mongo_url).await?;
         let db = mongo_client.database(&db_name);
         let special_col = db.collection::<mongodb::bson::Document>(&col_name);
         let cdn_col = db.collection::<mongodb::bson::Document>("cdn_registry");
-        tracing::info!("Connected to MongoDB ({}.{}) for special hashes", db_name, col_name);
+        let users_col = db.collection::<mongodb::bson::Document>(&users_col_name);
+        tracing::info!("Connected to MongoDB ({}.{}) for special hashes / file records", db_name, col_name);
         tracing::info!("Using MongoDB cdn_registry collection for CDN persistence");
-        (Some(special_col), Some(cdn_col))
+        tracing::info!("Using MongoDB '{}' collection for per-user ad gating", users_col_name);
+        (Some(special_col), Some(cdn_col), Some(users_col))
     } else {
-        tracing::warn!("MONGO_URL not set – special hashes and CDN persistence disabled");
-        (None, None)
+        tracing::warn!("MONGO_URL not set – special hashes, CDN persistence, and ad gating disabled");
+        (None, None, None)
     };
 
     // ── Build shared state ─────────────────────────────────────
@@ -1312,6 +1590,7 @@ async fn main() -> anyhow::Result<()> {
         lmdb_db,
         mongo_col,
         mongo_cdn_col,
+        mongo_users_col,
         special_hashes: Arc::new(DashMap::new()),
         best_cdn: Arc::new(RwLock::new(BestCdnCache::default())),
         rate_limiter: Arc::new(DashMap::new()),
