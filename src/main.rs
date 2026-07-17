@@ -37,8 +37,8 @@ use tokio::sync::RwLock;
 use tracing::debug;
 
 /// A user is shown ads again once their last ad is older than this window.
-/// Hard-coded to 2 days (in seconds) per product requirement.
-const AD_INTERVAL_SECS: f64 = 2.0 * 24.0 * 60.0 * 60.0;
+/// Hard-coded to 36 hours (in seconds) per product requirement.
+const AD_INTERVAL_SECS: f64 = 36.0 * 60.0 * 60.0;
 
 /// Ads are only shown to "established" users: their account must be at least
 /// this old (by join_date) AND they must have generated at least
@@ -453,7 +453,7 @@ async fn user_has_min_files(state: &AppState, user_id: i64, min: u64) -> bool {
 /// Only "established" users see ads — they must be at least 30 days old (by
 /// join_date) AND have generated at least MIN_LINKS_FOR_ADS links (file docs).
 /// For eligible users the usual ad_watch_time gate then applies:
-///   * ad_watch_time older than AD_INTERVAL_SECS (2 days)  → show ads
+///   * ad_watch_time older than AD_INTERVAL_SECS (36 hours) → show ads
 ///   * ad_watch_time field missing on an existing user doc → show ads
 /// Anything unresolvable (Mongo off, user/user_id/join_date missing, too new,
 /// too few links, or a query error) → serve directly (loop-safe: guarantees the
@@ -848,10 +848,32 @@ fn public_base_url(headers: &HeaderMap) -> Option<String> {
     Some(format!("{}://{}", proto, host))
 }
 
+/// Escape a string for safe insertion into an HTML attribute value.
+fn html_attr_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+/// Interstitial page shown *before* the arolinks ad. It explains what will
+/// happen, offers a Proceed button, and auto-redirects to `target_url` after 3s
+/// so users know the link is genuine. `action_desc` completes the sentence
+/// "After you complete it, ...".
+fn ad_interstitial_page(target_url: &str, action_desc: &str) -> Response {
+    let href = html_attr_escape(target_url);
+    let html = format!(
+        r#"<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Please wait</title><style>*{{box-sizing:border-box;margin:0;padding:0}}body{{font-family:'Segoe UI',system-ui,sans-serif;background:#0f1117;color:#e2e8f0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}}.card{{background:#1a1f2e;border:1px solid #2d3748;border-radius:16px;padding:40px 32px;max-width:460px;text-align:center;box-shadow:0 10px 40px rgba(0,0,0,.4)}}.emoji{{font-size:3rem;margin-bottom:16px}}h1{{font-size:1.4rem;color:#63b3ed;margin-bottom:12px}}p{{color:#a0aec0;font-size:1rem;line-height:1.6;margin-bottom:12px}}.count{{color:#68d391;font-weight:700}}.btn{{display:inline-block;margin-top:20px;background:#2b6cb0;color:#fff;text-decoration:none;border-radius:8px;padding:12px 32px;font-size:1rem;font-weight:600;cursor:pointer}}.btn:hover{{background:#3182ce}}.note{{margin-top:16px;font-size:.8rem;color:#718096}}</style></head><body><div class="card"><div class="emoji">&#127916;</div><h1>One quick ad first</h1><p>You'll be shown a short ad. After you complete it, {action_desc}.</p><p>Continuing in <span class="count" id="count">3</span>s&hellip;</p><a class="btn" id="go" href="{href}" data-target="{href}" rel="noopener">Proceed now &rarr;</a><div class="note">This link is valid &mdash; thanks for supporting us!</div></div><script>(function(){{var go=document.getElementById('go');var target=go.getAttribute('data-target');go.addEventListener('click',function(e){{e.preventDefault();window.location.href=target;}});var n=3;var c=document.getElementById('count');var timer=setInterval(function(){{n-=1;if(c){{c.textContent=n<0?0:n;}}if(n<=0){{clearInterval(timer);window.location.href=target;}}}},1000);}})();</script></body></html>"#
+    );
+    Html(html).into_response()
+}
+
 /// Build an arolinks ad whose final destination is the LB callback URL
-/// `<base>/<kind>/<hash>/<token>/<filename>`.  Returns None when an ad cannot
-/// be built (arolinks unconfigured, Host missing, or the shorten call failed)
-/// so the caller can serve the content directly instead.
+/// `<base>/<kind>/<hash>/<token>/<filename>`, wrapped in a friendly interstitial
+/// page that explains the flow before redirecting. Returns None when an ad
+/// cannot be built (arolinks unconfigured, Host missing, or the shorten call
+/// failed) so the caller can serve the content directly instead.
 async fn ad_redirect(
     state: &AppState,
     headers: &HeaderMap,
@@ -871,7 +893,11 @@ async fn ad_redirect(
         &callback,
     )
     .await?;
-    Some(axum::response::Redirect::to(&short).into_response())
+    let action = match kind {
+        LinkKind::Dl => "your download will start",
+        LinkKind::Watch => "your video will start playing",
+    };
+    Some(ad_interstitial_page(&short, action))
 }
 
 async fn nitai() -> impl IntoResponse {
@@ -1672,7 +1698,10 @@ async fn show_purchase_ad(state: &AppState, headers: &HeaderMap, user_id: i64, r
             )
             .await
             {
-                return axum::response::Redirect::to(&short).into_response();
+                return ad_interstitial_page(
+                    &short,
+                    "your ad-free time will be extended by 12 hours",
+                );
             }
         }
     }
