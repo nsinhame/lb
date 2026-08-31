@@ -193,22 +193,75 @@ impl Default for BestCdnCache {
 // SHARED APPLICATION STATE  (cheap to Clone – everything is Arc-backed)
 // ============================================================
 
+/// Which downstream project a CDN registry entry / request belongs to. The two
+/// pools are fully independent (separate LMDB sub-db, separate Mongo collection,
+/// separate best-CDN cache) since the two projects use unrelated hash/token
+/// schemes and must never be mixed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CdnPool {
+    /// plgb (WebStreamer): health-check GET /status, load JSON key "loads".
+    Plgb,
+    /// telethon-plgb (tgfs): health-check GET / (root), load JSON key "load".
+    Telethon,
+}
+
+impl CdnPool {
+    fn lmdb_db(self, state: &AppState) -> CdnDb {
+        match self {
+            CdnPool::Plgb => state.lmdb_db,
+            CdnPool::Telethon => state.lmdb_db_telethon,
+        }
+    }
+    fn mongo_col(self, state: &AppState) -> Option<&mongodb::Collection<mongodb::bson::Document>> {
+        match self {
+            CdnPool::Plgb => state.mongo_cdn_col.as_ref(),
+            CdnPool::Telethon => state.mongo_cdn_col_telethon.as_ref(),
+        }
+    }
+    fn best_cdn(self, state: &AppState) -> &Arc<RwLock<BestCdnCache>> {
+        match self {
+            CdnPool::Plgb => &state.best_cdn,
+            CdnPool::Telethon => &state.best_cdn_telethon,
+        }
+    }
+    /// Health-check path on the CDN itself (appended directly to the CDN's base URL).
+    fn health_path(self) -> &'static str {
+        match self {
+            CdnPool::Plgb => "/status",
+            CdnPool::Telethon => "/",
+        }
+    }
+    /// JSON key on the health response holding the per-client load map.
+    fn load_key(self) -> &'static str {
+        match self {
+            CdnPool::Plgb => "loads",
+            CdnPool::Telethon => "load",
+        }
+    }
+}
+
 #[derive(Clone)]
 struct AppState {
     lmdb_env: Arc<Env>,
+    /// plgb CDN registry (LMDB sub-db "cdns").
     lmdb_db: CdnDb,
+    /// telethon-plgb CDN registry (LMDB sub-db "cdns_telethon") — independent pool.
+    lmdb_db_telethon: CdnDb,
     /// MongoDB "file" collection: keyed by file `_id` (the URL hash). Holds
     /// `special_type` for some files and the owner `user_id` used for ad gating.
     /// (None if MONGO_URL not set)
     mongo_col: Option<mongodb::Collection<mongodb::bson::Document>>,
-    /// MongoDB collection for CDN registry persistence (None if MONGO_URL not set)
+    /// MongoDB collection for plgb CDN registry persistence (None if MONGO_URL not set)
     mongo_cdn_col: Option<mongodb::Collection<mongodb::bson::Document>>,
+    /// MongoDB collection for telethon-plgb CDN registry persistence (None if MONGO_URL not set)
+    mongo_cdn_col_telethon: Option<mongodb::Collection<mongodb::bson::Document>>,
     /// MongoDB "users" collection: docs keyed by `id` (= file's `user_id`) and
     /// holding `ad_watch_time`. (None if MONGO_URL not set)
     mongo_users_col: Option<mongodb::Collection<mongodb::bson::Document>>,
     /// key = file hash, value = special_type ("zero_ad", "one_ad", "two_ad", …)
     special_hashes: Arc<DashMap<String, String>>,
     best_cdn: Arc<RwLock<BestCdnCache>>,
+    best_cdn_telethon: Arc<RwLock<BestCdnCache>>,
     /// key = "ip:hash", value = list of request timestamps
     rate_limiter: Arc<DashMap<String, Vec<Instant>>>,
     trusted_hosts: Arc<RwLock<HashSet<String>>>,
@@ -227,10 +280,10 @@ fn now_unix() -> u64 {
         .as_secs()
 }
 
-async fn lmdb_set_cdn(state: &AppState, url: String, mut meta: CdnMeta) {
+async fn lmdb_set_cdn(state: &AppState, pool: CdnPool, url: String, mut meta: CdnMeta) {
     meta.ts = now_unix();
     let env = state.lmdb_env.clone();
-    let db = state.lmdb_db;
+    let db = pool.lmdb_db(state);
     let Ok(bytes) = serde_json::to_vec(&meta) else {
         return;
     };
@@ -242,9 +295,9 @@ async fn lmdb_set_cdn(state: &AppState, url: String, mut meta: CdnMeta) {
     .await;
 }
 
-async fn lmdb_delete_cdn(state: &AppState, url: String) {
+async fn lmdb_delete_cdn(state: &AppState, pool: CdnPool, url: String) {
     let env = state.lmdb_env.clone();
-    let db = state.lmdb_db;
+    let db = pool.lmdb_db(state);
     let _ = tokio::task::spawn_blocking(move || -> heed::Result<()> {
         let mut wtxn = env.write_txn()?;
         db.delete(&mut wtxn, url.as_str())?;
@@ -253,9 +306,9 @@ async fn lmdb_delete_cdn(state: &AppState, url: String) {
     .await;
 }
 
-async fn lmdb_get_cdn(state: &AppState, url: String) -> Option<CdnMeta> {
+async fn lmdb_get_cdn(state: &AppState, pool: CdnPool, url: String) -> Option<CdnMeta> {
     let env = state.lmdb_env.clone();
-    let db = state.lmdb_db;
+    let db = pool.lmdb_db(state);
     tokio::task::spawn_blocking(move || -> Option<CdnMeta> {
         let rtxn = env.read_txn().ok()?;
         // .to_vec() copies the bytes out before the transaction is dropped
@@ -268,9 +321,9 @@ async fn lmdb_get_cdn(state: &AppState, url: String) -> Option<CdnMeta> {
     .flatten()
 }
 
-async fn lmdb_list_cdns(state: &AppState) -> Vec<(String, CdnMeta)> {
+async fn lmdb_list_cdns(state: &AppState, pool: CdnPool) -> Vec<(String, CdnMeta)> {
     let env = state.lmdb_env.clone();
-    let db = state.lmdb_db;
+    let db = pool.lmdb_db(state);
     tokio::task::spawn_blocking(move || -> heed::Result<Vec<(String, CdnMeta)>> {
         let rtxn = env.read_txn()?;
         let mut result = Vec::new();
@@ -293,7 +346,7 @@ async fn lmdb_list_cdns(state: &AppState) -> Vec<(String, CdnMeta)> {
 // ============================================================
 
 async fn rebuild_trusted_hosts(state: &AppState) {
-    let cdns = lmdb_list_cdns(state).await;
+    let cdns = lmdb_list_cdns(state, CdnPool::Plgb).await;
     let mut hosts = state.trusted_hosts.write().await;
     hosts.clear();
     hosts.insert("localhost".to_string());
@@ -357,9 +410,9 @@ async fn load_special_hashes(state: &AppState) {
 // CDN REGISTRY PERSISTENCE  (MongoDB cdn_registry collection)
 // ============================================================
 
-/// Upsert a CDN URL into the MongoDB cdn_registry collection.
-async fn mongo_add_cdn(state: &AppState, url: &str) {
-    let Some(col) = &state.mongo_cdn_col else { return };
+/// Upsert a CDN URL into the pool's MongoDB cdn_registry collection.
+async fn mongo_add_cdn(state: &AppState, pool: CdnPool, url: &str) {
+    let Some(col) = pool.mongo_col(state) else { return };
     let filter = doc! { "_id": url };
     let update = doc! { "$setOnInsert": { "_id": url } };
     let opts = mongodb::options::UpdateOptions::builder().upsert(true).build();
@@ -368,11 +421,72 @@ async fn mongo_add_cdn(state: &AppState, url: &str) {
     }
 }
 
-/// Remove a CDN URL from the MongoDB cdn_registry collection.
-async fn mongo_remove_cdn(state: &AppState, url: &str) {
-    let Some(col) = &state.mongo_cdn_col else { return };
+/// Remove a CDN URL from the pool's MongoDB cdn_registry collection.
+async fn mongo_remove_cdn(state: &AppState, pool: CdnPool, url: &str) {
+    let Some(col) = pool.mongo_col(state) else { return };
     if let Err(e) = col.delete_one(doc! { "_id": url }, None).await {
         tracing::warn!("MongoDB cdn_registry delete error for {}: {}", url, e);
+    }
+}
+
+/// Load CDN URLs persisted in MongoDB (pool's cdn_registry collection) into this
+/// instance's LMDB pool, defaulting each to an "offline, unknown" state until the
+/// poller confirms it (or the immediate-probe path in add_cdn_generic does).
+async fn load_persisted_cdns(state: &AppState, pool: CdnPool) -> usize {
+    let Some(cdn_col) = pool.mongo_col(state) else { return 0 };
+    let mut loaded = 0usize;
+    match cdn_col.find(None, None).await {
+        Ok(mut cursor) => loop {
+            match cursor.advance().await {
+                Ok(true) => {
+                    if let Ok(doc) = cursor.deserialize_current() {
+                        if let Ok(url) = doc.get_str("_id").map(|s| s.to_string()) {
+                            if url.starts_with("http") && lmdb_get_cdn(state, pool, url.clone()).await.is_none() {
+                                lmdb_set_cdn(
+                                    state,
+                                    pool,
+                                    url,
+                                    CdnMeta {
+                                        load: 99999,
+                                        last_ok: 0,
+                                        fail_count: 0,
+                                        ..Default::default()
+                                    },
+                                )
+                                .await;
+                                loaded += 1;
+                            }
+                        }
+                    }
+                }
+                _ => break,
+            }
+        },
+        Err(e) => tracing::error!("MongoDB error loading cdn_registry: {}", e),
+    }
+    loaded
+}
+
+/// Seed CDN URLs from a comma-separated env var (e.g. LB_CDN_URLS[_TELETHON]).
+async fn seed_cdns_from_env(state: &AppState, pool: CdnPool, var_name: &str) {
+    let Ok(env_cdns) = std::env::var(var_name) else { return };
+    for raw in env_cdns.split(',') {
+        let u = raw.trim().trim_end_matches('/').to_string();
+        if u.starts_with("http") && lmdb_get_cdn(state, pool, u.clone()).await.is_none() {
+            lmdb_set_cdn(
+                state,
+                pool,
+                u.clone(),
+                CdnMeta {
+                    load: 99999,
+                    last_ok: 0,
+                    fail_count: 0,
+                    ..Default::default()
+                },
+            )
+            .await;
+            mongo_add_cdn(state, pool, &u).await;
+        }
     }
 }
 
@@ -562,10 +676,10 @@ async fn set_ad_watch_time(state: &AppState, user_id: i64, value: f64) -> bool {
 // ============================================================
 
 
-async fn get_best_cdn(state: &AppState) -> Option<String> {
+async fn get_best_cdn(state: &AppState, pool: CdnPool) -> Option<String> {
     // Return cached value if still fresh
     {
-        let cache = state.best_cdn.read().await;
+        let cache = pool.best_cdn(state).read().await;
         if let Some(ref url) = cache.url {
             if cache.updated.elapsed() < state.config.best_cdn_ttl {
                 return Some(url.clone());
@@ -573,7 +687,7 @@ async fn get_best_cdn(state: &AppState) -> Option<String> {
         }
     }
 
-    let cdns = lmdb_list_cdns(state).await;
+    let cdns = lmdb_list_cdns(state, pool).await;
 
     // Deduplicate by IP: if two URLs resolve to the same server, only count once.
     // For each IP group, keep the URL with the lowest load.
@@ -612,7 +726,7 @@ async fn get_best_cdn(state: &AppState) -> Option<String> {
 
     // Cache the result
     {
-        let mut cache = state.best_cdn.write().await;
+        let mut cache = pool.best_cdn(state).write().await;
         cache.url = Some(chosen.clone());
         cache.updated = Instant::now();
     }
@@ -1151,11 +1265,12 @@ async fn resolve_cdn_ip(url: &str) -> String {
     addrs.next().map(|a| a.ip().to_string()).unwrap_or_default()
 }
 
-/// Returns (url, ok, load, error_code, ip)
-async fn check_cdn_health(client: Client, url: String) -> (String, bool, u64, String, String) {
+/// Returns (url, ok, load, error_code, ip). `pool` picks the health-check path
+/// (/status vs /) and the load-map JSON key ("loads" vs "load").
+async fn check_cdn_health(client: Client, url: String, pool: CdnPool) -> (String, bool, u64, String, String) {
     let ip = resolve_cdn_ip(&url).await;
     let result = client
-        .get(format!("{}/status", url))
+        .get(format!("{}{}", url, pool.health_path()))
         .timeout(Duration::from_secs(3))
         .send()
         .await;
@@ -1169,7 +1284,7 @@ async fn check_cdn_health(client: Client, url: String) -> (String, bool, u64, St
             match resp.json::<Value>().await {
                 Ok(js) => {
                     let total: u64 = js
-                        .get("loads")
+                        .get(pool.load_key())
                         .and_then(|l| l.as_object())
                         .map(|m| m.values().filter_map(|v| v.as_u64()).sum())
                         .unwrap_or(99999);
@@ -1193,17 +1308,17 @@ async fn check_cdn_health(client: Client, url: String) -> (String, bool, u64, St
 // CDN POLLER (runs only on the leader instance)
 // ============================================================
 
-async fn poller_task(state: AppState) {
+async fn poller_task(state: AppState, pool: CdnPool) {
     let interval = Duration::from_secs(state.config.poll_interval);
     loop {
-        let cdns = lmdb_list_cdns(&state).await;
+        let cdns = lmdb_list_cdns(&state, pool).await;
 
         // Fan-out: check all CDNs concurrently
         let mut handles = Vec::with_capacity(cdns.len());
         for (url, _) in &cdns {
             let client = state.http_client.clone();
             let url = url.clone();
-            handles.push(tokio::spawn(check_cdn_health(client, url)));
+            handles.push(tokio::spawn(check_cdn_health(client, url, pool)));
         }
 
         // Build a lookup map for previous fail counts
@@ -1222,6 +1337,7 @@ async fn poller_task(state: AppState) {
             if ok {
                 lmdb_set_cdn(
                     &state,
+                    pool,
                     url,
                     CdnMeta {
                         load,
@@ -1238,11 +1354,12 @@ async fn poller_task(state: AppState) {
                 let fail_count = prev_fail + 1;
                 if fail_count >= state.config.fail_threshold {
                     debug!("Purging dead CDN: {}", url);
-                    mongo_remove_cdn(&state, &url).await;
-                    lmdb_delete_cdn(&state, url).await;
+                    mongo_remove_cdn(&state, pool, &url).await;
+                    lmdb_delete_cdn(&state, pool, url).await;
                 } else {
                     lmdb_set_cdn(
                         &state,
+                        pool,
                         url,
                         CdnMeta {
                             load: 99999,
@@ -1259,11 +1376,14 @@ async fn poller_task(state: AppState) {
             }
         }
 
-        rebuild_trusted_hosts(&state).await;
+        // Trusted-host whitelisting backs referer-blocking, a plgb-only concept.
+        if pool == CdnPool::Plgb {
+            rebuild_trusted_hosts(&state).await;
+        }
 
         // Invalidate best-CDN cache so next request re-evaluates with fresh loads
         {
-            let mut cache = state.best_cdn.write().await;
+            let mut cache = pool.best_cdn(&state).write().await;
             cache.url = None;
             cache.updated = Instant::now() - Duration::from_secs(9999);
         }
@@ -1384,11 +1504,7 @@ async fn health() -> &'static str {
     "ok"
 }
 
-async fn add_cdn(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    axum::extract::Json(body): axum::extract::Json<Value>,
-) -> Response {
+async fn add_cdn_generic(state: AppState, headers: HeaderMap, body: Value, pool: CdnPool) -> Response {
     if let Err(e) = check_admin(&headers, &state.config) {
         return e;
     }
@@ -1398,10 +1514,11 @@ async fn add_cdn(
             if let Some(url_str) = u.as_str() {
                 let url = url_str.trim_end_matches('/').to_string();
                 if url.starts_with("http")
-                    && lmdb_get_cdn(&state, url.clone()).await.is_none()
+                    && lmdb_get_cdn(&state, pool, url.clone()).await.is_none()
                 {
                     lmdb_set_cdn(
                         &state,
+                        pool,
                         url.clone(),
                         CdnMeta {
                             load: 99999,
@@ -1411,13 +1528,16 @@ async fn add_cdn(
                         },
                     )
                     .await;
-                    mongo_add_cdn(&state, &url).await;
+                    mongo_add_cdn(&state, pool, &url).await;
                     added.push(url);
                 }
             }
         }
     }
-    rebuild_trusted_hosts(&state).await;
+    // Trusted-host whitelisting backs referer-blocking, a plgb-only concept.
+    if pool == CdnPool::Plgb {
+        rebuild_trusted_hosts(&state).await;
+    }
 
     // Immediately poll newly added CDNs so they become available within seconds
     if !added.is_empty() {
@@ -1428,7 +1548,7 @@ async fn add_cdn(
             for url in &urls_to_probe {
                 let client = s.http_client.clone();
                 let url = url.clone();
-                handles.push(tokio::spawn(check_cdn_health(client, url)));
+                handles.push(tokio::spawn(check_cdn_health(client, url, pool)));
             }
             for handle in handles {
                 let Ok((url, ok, load, error_code, ip)) = handle.await else {
@@ -1437,6 +1557,7 @@ async fn add_cdn(
                 if ok {
                     lmdb_set_cdn(
                         &s,
+                        pool,
                         url.clone(),
                         CdnMeta {
                             load,
@@ -1455,13 +1576,29 @@ async fn add_cdn(
                 }
             }
             // Invalidate cache so next request picks up the new CDN immediately
-            let mut cache = s.best_cdn.write().await;
+            let mut cache = pool.best_cdn(&s).write().await;
             cache.url = None;
             cache.updated = Instant::now() - Duration::from_secs(9999);
         });
     }
 
     Json(json!({"added": added})).into_response()
+}
+
+async fn add_cdn(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Json(body): axum::extract::Json<Value>,
+) -> Response {
+    add_cdn_generic(state, headers, body, CdnPool::Plgb).await
+}
+
+async fn add_cdn_telethon(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Json(body): axum::extract::Json<Value>,
+) -> Response {
+    add_cdn_generic(state, headers, body, CdnPool::Telethon).await
 }
 
 // ============================================================
@@ -1501,7 +1638,7 @@ fn redirect_to(state: &AppState, location: &str) -> Response {
 
 /// Redirect the client to the best CDN's /dl endpoint.
 async fn serve_dl(state: &AppState, hash: &str, filename: &str) -> Response {
-    match get_best_cdn(state).await {
+    match get_best_cdn(state, CdnPool::Plgb).await {
         Some(cdn) => redirect_to(state, &format!("{}/dl/{}/{}", cdn, hash, filename)),
         None => (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1513,7 +1650,7 @@ async fn serve_dl(state: &AppState, hash: &str, filename: &str) -> Response {
 
 /// Stream the best CDN's /watch endpoint back to the client (rewriting HTML).
 async fn serve_watch(state: &AppState, hash: &str, filename: &str, headers: HeaderMap) -> Response {
-    match get_best_cdn(state).await {
+    match get_best_cdn(state, CdnPool::Plgb).await {
         Some(cdn) => {
             let upstream_url = format!("{}/watch/{}/{}", cdn, hash, filename);
             match stream_upstream(&state.http_client, &upstream_url, headers, hash, filename).await {
@@ -1613,6 +1750,45 @@ async fn watch(
     headers: HeaderMap,
 ) -> Response {
     handle_link(state, addr, LinkKind::Watch, hash, filename, headers).await
+}
+
+// ============================================================
+// TELETHON-PLGB LINK HANDLING  (separate CDN pool, under /t/*)
+// telethon-plgb's /dl and /wt both stream raw bytes directly (no HTML watch
+// page to rewrite, unlike plgb's /watch), so a plain redirect suffices for
+// both — no streaming proxy needed. The payload/sig pair is an opaque
+// HMAC-signed token the CDN itself verifies; the LB just forwards it.
+// ============================================================
+
+#[derive(Deserialize)]
+struct PayloadSigPath {
+    payload: String,
+    sig: String,
+}
+
+async fn serve_telethon(state: &AppState, path: &str, payload: &str, sig: &str) -> Response {
+    match get_best_cdn(state, CdnPool::Telethon).await {
+        Some(cdn) => redirect_to(state, &format!("{}/{}/{}/{}", cdn, path, payload, sig)),
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "No CDN online"})),
+        )
+            .into_response(),
+    }
+}
+
+async fn t_dl(
+    State(state): State<AppState>,
+    Path(PayloadSigPath { payload, sig }): Path<PayloadSigPath>,
+) -> Response {
+    serve_telethon(&state, "dl", &payload, &sig).await
+}
+
+async fn t_wt(
+    State(state): State<AppState>,
+    Path(PayloadSigPath { payload, sig }): Path<PayloadSigPath>,
+) -> Response {
+    serve_telethon(&state, "wt", &payload, &sig).await
 }
 
 // ============================================================
@@ -1785,37 +1961,46 @@ async fn ad_tokens_callback(
     }
 }
 
-async fn stats(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if let Err(e) = check_admin(&headers, &state.config) {
-        return e;
-    }
-    let cdns = lmdb_list_cdns(&state).await;
-    let cdn_list: Vec<Value> = cdns
-        .iter()
+fn cdn_list_json(cdns: &[(String, CdnMeta)], fail_threshold: u64) -> Vec<Value> {
+    cdns.iter()
         .map(|(url, meta)| {
             json!({
                 "url": url,
                 "load": meta.load,
                 "last_ok": meta.last_ok,
-                "fail_count": format!("{}/{}", meta.fail_count, state.config.fail_threshold),
+                "fail_count": format!("{}/{}", meta.fail_count, fail_threshold),
                 "updated_at": meta.updated_at,
                 "error_code": meta.error_code,
                 "ip": meta.ip,
             })
         })
-        .collect();
+        .collect()
+}
+
+async fn stats(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(e) = check_admin(&headers, &state.config) {
+        return e;
+    }
+    let cdns = lmdb_list_cdns(&state, CdnPool::Plgb).await;
+    let cdn_list = cdn_list_json(&cdns, state.config.fail_threshold);
+
+    let cdns_telethon = lmdb_list_cdns(&state, CdnPool::Telethon).await;
+    let cdn_list_telethon = cdn_list_json(&cdns_telethon, state.config.fail_threshold);
 
     let trusted: Vec<String> = {
         let mut v: Vec<_> = state.trusted_hosts.read().await.iter().cloned().collect();
         v.sort();
         v
     };
-    let best = get_best_cdn(&state).await;
+    let best = get_best_cdn(&state, CdnPool::Plgb).await;
+    let best_telethon = get_best_cdn(&state, CdnPool::Telethon).await;
 
     Json(json!({
         "cdns": cdn_list,
         "trusted_hosts": trusted,
         "best_cdn": best,
+        "cdns_telethon": cdn_list_telethon,
+        "best_cdn_telethon": best_telethon,
     }))
     .into_response()
 }
@@ -1889,7 +2074,7 @@ async fn main() -> anyhow::Result<()> {
         // SAFETY: we open this path exactly once in this process.
         EnvOpenOptions::new()
             .map_size(512 * 1024 * 1024) // 512 MB – same as Python
-            .max_dbs(1)
+            .max_dbs(2) // one sub-db per CDN pool (plgb, telethon-plgb)
             .open("cdn.lmdb")?
     });
 
@@ -1900,6 +2085,12 @@ async fn main() -> anyhow::Result<()> {
         wtxn.commit()?;
         db
     };
+    let lmdb_db_telethon: CdnDb = {
+        let mut wtxn = env.write_txn()?;
+        let db = env.create_database(&mut wtxn, Some("cdns_telethon"))?;
+        wtxn.commit()?;
+        db
+    };
 
     // ── HTTP client (no global timeout – set per-request) ──────
     let http_client = reqwest::Client::builder()
@@ -1907,7 +2098,8 @@ async fn main() -> anyhow::Result<()> {
         .build()?;
 
     // MongoDB for special hashes, CDN persistence, and per-user ad gating – MONGO_URL triggers all
-    let (mongo_col, mongo_cdn_col, mongo_users_col): (
+    let (mongo_col, mongo_cdn_col, mongo_cdn_col_telethon, mongo_users_col): (
+        Option<mongodb::Collection<mongodb::bson::Document>>,
         Option<mongodb::Collection<mongodb::bson::Document>>,
         Option<mongodb::Collection<mongodb::bson::Document>>,
         Option<mongodb::Collection<mongodb::bson::Document>>,
@@ -1922,25 +2114,29 @@ async fn main() -> anyhow::Result<()> {
         let db = mongo_client.database(&db_name);
         let special_col = db.collection::<mongodb::bson::Document>(&col_name);
         let cdn_col = db.collection::<mongodb::bson::Document>("cdn_registry");
+        let cdn_col_telethon = db.collection::<mongodb::bson::Document>("cdn_registry_telethon");
         let users_col = db.collection::<mongodb::bson::Document>(&users_col_name);
         tracing::info!("Connected to MongoDB ({}.{}) for special hashes / file records", db_name, col_name);
-        tracing::info!("Using MongoDB cdn_registry collection for CDN persistence");
+        tracing::info!("Using MongoDB cdn_registry / cdn_registry_telethon collections for CDN persistence");
         tracing::info!("Using MongoDB '{}' collection for per-user ad gating", users_col_name);
-        (Some(special_col), Some(cdn_col), Some(users_col))
+        (Some(special_col), Some(cdn_col), Some(cdn_col_telethon), Some(users_col))
     } else {
         tracing::warn!("MONGO_URL not set – special hashes, CDN persistence, and ad gating disabled");
-        (None, None, None)
+        (None, None, None, None)
     };
 
     // ── Build shared state ─────────────────────────────────────
     let state = AppState {
         lmdb_env: env,
         lmdb_db,
+        lmdb_db_telethon,
         mongo_col,
         mongo_cdn_col,
+        mongo_cdn_col_telethon,
         mongo_users_col,
         special_hashes: Arc::new(DashMap::new()),
         best_cdn: Arc::new(RwLock::new(BestCdnCache::default())),
+        best_cdn_telethon: Arc::new(RwLock::new(BestCdnCache::default())),
         rate_limiter: Arc::new(DashMap::new()),
         trusted_hosts: Arc::new(RwLock::new(HashSet::from([
             "localhost".to_string(),
@@ -1951,62 +2147,14 @@ async fn main() -> anyhow::Result<()> {
         http_client,
     };
 
-    // ── Load persisted CDNs from MongoDB cdn_registry ──────────
-    if let Some(ref cdn_col) = state.mongo_cdn_col {
-        match cdn_col.find(None, None).await {
-            Ok(mut cursor) => {
-                let mut loaded = 0usize;
-                loop {
-                    match cursor.advance().await {
-                        Ok(true) => {
-                            if let Ok(doc) = cursor.deserialize_current() {
-                                if let Ok(url) = doc.get_str("_id").map(|s| s.to_string()) {
-                                    if url.starts_with("http") && lmdb_get_cdn(&state, url.clone()).await.is_none() {
-                                        lmdb_set_cdn(
-                                            &state,
-                                            url,
-                                            CdnMeta {
-                                                load: 99999,
-                                                last_ok: 0,
-                                                fail_count: 0,
-                                                ..Default::default()
-                                            },
-                                        )
-                                        .await;
-                                        loaded += 1;
-                                    }
-                                }
-                            }
-                        }
-                        _ => break,
-                    }
-                }
-                tracing::info!("Loaded {} CDN(s) from MongoDB cdn_registry", loaded);
-            }
-            Err(e) => tracing::error!("MongoDB error loading cdn_registry: {}", e),
-        }
-    }
+    // ── Load persisted CDNs from MongoDB, then seed from env vars (both pools) ──
+    let loaded = load_persisted_cdns(&state, CdnPool::Plgb).await;
+    tracing::info!("Loaded {} CDN(s) from MongoDB cdn_registry", loaded);
+    let loaded_telethon = load_persisted_cdns(&state, CdnPool::Telethon).await;
+    tracing::info!("Loaded {} CDN(s) from MongoDB cdn_registry_telethon", loaded_telethon);
 
-    // ── Seed CDNs from LB_CDN_URLS env var ────────────────────
-    if let Ok(env_cdns) = std::env::var("LB_CDN_URLS") {
-        for raw in env_cdns.split(',') {
-            let u = raw.trim().trim_end_matches('/').to_string();
-            if u.starts_with("http") && lmdb_get_cdn(&state, u.clone()).await.is_none() {
-                lmdb_set_cdn(
-                    &state,
-                    u.clone(),
-                    CdnMeta {
-                        load: 99999,
-                        last_ok: 0,
-                        fail_count: 0,
-                        ..Default::default()
-                    },
-                )
-                .await;
-                mongo_add_cdn(&state, &u).await;
-            }
-        }
-    }
+    seed_cdns_from_env(&state, CdnPool::Plgb, "LB_CDN_URLS").await;
+    seed_cdns_from_env(&state, CdnPool::Telethon, "LB_CDN_URLS_TELETHON").await;
 
     rebuild_trusted_hosts(&state).await;
 
@@ -2033,10 +2181,12 @@ async fn main() -> anyhow::Result<()> {
 
     if is_leader {
         let s = state.clone();
-        tokio::spawn(poller_task(s));
-        tracing::info!("CDN poller started");
+        tokio::spawn(poller_task(s, CdnPool::Plgb));
+        let s_telethon = state.clone();
+        tokio::spawn(poller_task(s_telethon, CdnPool::Telethon));
+        tracing::info!("CDN pollers started (plgb + telethon-plgb)");
     } else {
-        tracing::warn!("CDN poller disabled (IS_LEADER=0)");
+        tracing::warn!("CDN pollers disabled (IS_LEADER=0)");
     }
 
     // ── Router ─────────────────────────────────────────────────
@@ -2044,9 +2194,12 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(health))
         .route("/nitai", get(nitai))
         .route("/add_cdn", post(add_cdn))
+        .route("/add_cdn_telethon", post(add_cdn_telethon))
         .route("/reload_special", post(reload_special))
         .route("/dl/:hash/*filename", get(dl))
         .route("/watch/:hash/*filename", get(watch))
+        .route("/t/dl/:payload/:sig", get(t_dl))
+        .route("/t/wt/:payload/:sig", get(t_wt))
         .route("/ad-tokens/:user_id/:rand", get(ad_tokens_entry))
         .route("/ad-tokens/:user_id/:rand/:token", get(ad_tokens_callback))
         .route("/stats", get(stats))
