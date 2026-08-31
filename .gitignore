@@ -1,0 +1,3 @@
+# Ignore Python reference implementations (not part of the Rust load balancer)
+plgb/
+telethon-plgb/
