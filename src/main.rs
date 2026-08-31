@@ -484,6 +484,11 @@ async fn should_show_ads(state: &AppState, hash: &str) -> bool {
         }
     };
 
+    // Paid ("Plus") users are never shown ads.
+    if matches!(user_doc.get_str("Plan"), Ok(p) if p.eq_ignore_ascii_case("plus")) {
+        return false;
+    }
+
     let now = now_unix_f64();
 
     // Established-user gate 1: account at least 30 days old.
