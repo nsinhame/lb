@@ -1081,6 +1081,7 @@ async fn nitai() -> impl IntoResponse {
   .load-bar.warn{background:linear-gradient(90deg,#f6ad55,#ed8936)}
   .load-bar.danger{background:linear-gradient(90deg,#fc8181,#e53e3e)}
   .section-title{font-size:.95rem;font-weight:600;color:#a0aec0;margin-bottom:10px}
+  .pool-heading{font-size:1.05rem;font-weight:700;color:#63b3ed;letter-spacing:.3px}
   .empty{color:#4a5568;font-style:italic;font-size:.85rem;padding:12px 0}
   .trusted-list{display:flex;flex-wrap:wrap;gap:6px;margin-top:4px}
   .trusted-chip{background:#1a365d;color:#90cdf4;border-radius:6px;padding:3px 10px;font-size:.78rem;font-family:monospace}
@@ -1095,6 +1096,7 @@ async fn nitai() -> impl IntoResponse {
   <div id="status-bar"><div id="dot"></div><span id="last-update">Loading…</span></div>
 </header>
 <main>
+  <div class="pool-heading">plgb</div>
   <div class="row" id="summary-cards">
     <div class="card"><h2>Total CDNs</h2><div class="stat-val" id="total-cdns">–</div><div class="stat-sub">registered</div></div>
     <div class="card"><h2>Online CDNs</h2><div class="stat-val" id="online-cdns" style="color:#68d391">–</div><div class="stat-sub">responding</div></div>
@@ -1108,6 +1110,23 @@ async fn nitai() -> impl IntoResponse {
     <table>
       <thead><tr><th>URL</th><th>Status</th><th>Load</th><th>Load Bar</th><th>Fail Count</th><th>Last Updated</th></tr></thead>
       <tbody id="cdn-table-body"><tr><td colspan="6" class="empty">Loading…</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="pool-heading">telethon-plgb</div>
+  <div class="row" id="summary-cards-t">
+    <div class="card"><h2>Total CDNs</h2><div class="stat-val" id="total-cdns-t">–</div><div class="stat-sub">registered</div></div>
+    <div class="card"><h2>Online CDNs</h2><div class="stat-val" id="online-cdns-t" style="color:#68d391">–</div><div class="stat-sub">responding</div></div>
+    <div class="card"><h2>Offline CDNs</h2><div class="stat-val" id="offline-cdns-t" style="color:#fc8181">–</div><div class="stat-sub">unreachable</div></div>
+    <div class="card"><h2>Total Load</h2><div class="stat-val" id="total-load-t">–</div><div class="stat-sub">active connections</div></div>
+    <div class="card"><h2>Best CDN</h2><div id="best-cdn-val-t">–</div><div class="stat-sub">current selection</div></div>
+  </div>
+
+  <div class="card">
+    <div class="section-title">CDN Registry</div>
+    <table>
+      <thead><tr><th>URL</th><th>Status</th><th>Load</th><th>Load Bar</th><th>Fail Count</th><th>Last Updated</th></tr></thead>
+      <tbody id="cdn-table-body-t"><tr><td colspan="6" class="empty">Loading…</td></tr></tbody>
     </table>
   </div>
 
@@ -1168,20 +1187,9 @@ async function fetchStats() {
   }
 }
 
-function render(data) {
-  if (!data || data.__error !== undefined) {
-    const code = data && data.__error;
-    const msg = code === 401 ? 'Wrong admin key – check ?key= in URL'
-               : code === 0  ? 'Cannot reach server'
-               : 'Server error ' + code;
-    document.getElementById('last-update').textContent = msg;
-    document.getElementById('dot').style.background = '#fc8181';
-    return;
-  }
-  document.getElementById('dot').style.background = '#68d391';
-  document.getElementById('last-update').textContent = 'Updated ' + new Date().toLocaleTimeString();
-
-  const cdns = data.cdns || [];
+// Renders one pool's summary cards + CDN table. suffix = '' for plgb, '-t' for
+// telethon; statusPath is the CDN's own health-check path ('/status' or '/').
+function renderPool(cdns, best, suffix, statusPath) {
   const online = cdns.filter(c => c.last_ok === 1);
   const offline = cdns.filter(c => c.last_ok !== 1);
   const seenIps = new Set();
@@ -1192,30 +1200,30 @@ function render(data) {
     return s + (c.load < 99999 ? c.load : 0);
   }, 0);
 
-  document.getElementById('total-cdns').textContent = cdns.length;
-  document.getElementById('online-cdns').textContent = online.length;
-  document.getElementById('offline-cdns').textContent = offline.length;
-  document.getElementById('total-load').textContent = totalLoad;
+  document.getElementById('total-cdns' + suffix).textContent = cdns.length;
+  document.getElementById('online-cdns' + suffix).textContent = online.length;
+  document.getElementById('offline-cdns' + suffix).textContent = offline.length;
+  document.getElementById('total-load' + suffix).textContent = totalLoad;
 
-  const best = data.best_cdn;
-  const bestEl = document.getElementById('best-cdn-val');
+  const bestEl = document.getElementById('best-cdn-val' + suffix);
   if (best) {
     const host = (() => { try { return new URL(best).hostname; } catch(e) { return best; }})();
     bestEl.textContent = host;
     bestEl.title = best;
+    bestEl.style.color = '#68d391';
   } else {
     bestEl.textContent = 'None';
+    bestEl.title = '';
     bestEl.style.color = '#fc8181';
   }
 
-  // CDN table
-  const tbody = document.getElementById('cdn-table-body');
+  const tbody = document.getElementById('cdn-table-body' + suffix);
   if (cdns.length === 0) {
     tbody.innerHTML = '<tr><td colspan="6" class="empty">No CDNs registered</td></tr>';
   } else {
     tbody.innerHTML = cdns.map(c => {
       const host = (() => { try { return new URL(c.url).hostname; } catch(e) { return c.url; }})();
-      const statusUrl = (c.url.startsWith('http') ? c.url : 'https://' + c.url) + '/status';
+      const statusUrl = (c.url.startsWith('http') ? c.url : 'https://' + c.url) + statusPath;
       const lc = loadColor(c.load);
       const bw = loadBarWidth(c.load);
       const loadDisp = c.load >= 99999 ? '∞' : c.load;
@@ -1229,8 +1237,25 @@ function render(data) {
       </tr>`;
     }).join('');
   }
+}
 
-  // Trusted hosts
+function render(data) {
+  if (!data || data.__error !== undefined) {
+    const code = data && data.__error;
+    const msg = code === 401 ? 'Wrong admin key – check ?key= in URL'
+               : code === 0  ? 'Cannot reach server'
+               : 'Server error ' + code;
+    document.getElementById('last-update').textContent = msg;
+    document.getElementById('dot').style.background = '#fc8181';
+    return;
+  }
+  document.getElementById('dot').style.background = '#68d391';
+  document.getElementById('last-update').textContent = 'Updated ' + new Date().toLocaleTimeString();
+
+  renderPool(data.cdns || [], data.best_cdn, '', '/status');
+  renderPool(data.cdns_telethon || [], data.best_cdn_telethon, '-t', '/');
+
+  // Trusted hosts (plgb referer whitelist only)
   const trusted = data.trusted_hosts || [];
   document.getElementById('trusted-list').innerHTML =
     trusted.map(h => `<span class="trusted-chip">${h}</span>`).join('');
