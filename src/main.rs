@@ -71,6 +71,10 @@ struct Config {
     /// Global master switch for showing ads (LB_SHOW_ADS; default on).
     show_ads: bool,
     tg_redirect: String,
+    /// Master switch for the plgb CDN pool/routes (LB_ENABLE_PLGB; default on).
+    enable_plgb: bool,
+    /// Master switch for the telethon-plgb CDN pool/routes (LB_ENABLE_TELETHON; default on).
+    enable_telethon: bool,
     max_requests_per_ip: usize,
     ttl_seconds: u64,
     poll_interval: u64,
@@ -104,6 +108,17 @@ impl Config {
             .map(|v| !matches!(v.trim().to_lowercase().as_str(), "0" | "false" | "no" | "off"))
             .unwrap_or(true);
 
+        // Per-pool master switches. Unset -> pool on; "0"/"false"/"no"/"off" -> that
+        // pool's routes/poller/CDN loading are skipped entirely.
+        let enable_plgb = std::env::var("LB_ENABLE_PLGB")
+            .ok()
+            .map(|v| !matches!(v.trim().to_lowercase().as_str(), "0" | "false" | "no" | "off"))
+            .unwrap_or(true);
+        let enable_telethon = std::env::var("LB_ENABLE_TELETHON")
+            .ok()
+            .map(|v| !matches!(v.trim().to_lowercase().as_str(), "0" | "false" | "no" | "off"))
+            .unwrap_or(true);
+
         Config {
             arolinks_api: std::env::var("AROLINKS_API_TOKEN").ok(),
             arolinks_endpoint: "https://arolinks.com/api".to_string(),
@@ -111,6 +126,8 @@ impl Config {
             ad_secret,
             show_ads,
             tg_redirect: std::env::var("REDIRECT_TO").unwrap_or_default(),
+            enable_plgb,
+            enable_telethon,
             max_requests_per_ip: std::env::var("LB_MAX_REQUESTS_PER_IP")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -2045,11 +2062,21 @@ async fn main() -> anyhow::Result<()> {
     if config.admin_key.is_empty() {
         anyhow::bail!("LB_ADMIN_KEY env var is required but not set");
     }
-    if config.tg_redirect.is_empty() {
+    if config.enable_plgb && config.tg_redirect.is_empty() {
         anyhow::bail!("REDIRECT_TO env var is required but not set");
     }
     if !config.show_ads {
         tracing::warn!("LB_SHOW_ADS is off - ads are globally disabled");
+    }
+    if !config.enable_plgb && !config.enable_telethon {
+        tracing::warn!("LB_ENABLE_PLGB and LB_ENABLE_TELETHON are both false - no CDN traffic will be routed");
+    } else {
+        if !config.enable_plgb {
+            tracing::warn!("LB_ENABLE_PLGB is false - plgb CDN pool/routes disabled");
+        }
+        if !config.enable_telethon {
+            tracing::warn!("LB_ENABLE_TELETHON is false - telethon-plgb CDN pool/routes disabled");
+        }
     }
     if config.arolinks_api.is_none() {
         tracing::warn!("AROLINKS_API_TOKEN not set – one_ad and two_ad will fall back to direct Telegram redirect");
@@ -2147,14 +2174,17 @@ async fn main() -> anyhow::Result<()> {
         http_client,
     };
 
-    // ── Load persisted CDNs from MongoDB, then seed from env vars (both pools) ──
-    let loaded = load_persisted_cdns(&state, CdnPool::Plgb).await;
-    tracing::info!("Loaded {} CDN(s) from MongoDB cdn_registry", loaded);
-    let loaded_telethon = load_persisted_cdns(&state, CdnPool::Telethon).await;
-    tracing::info!("Loaded {} CDN(s) from MongoDB cdn_registry_telethon", loaded_telethon);
-
-    seed_cdns_from_env(&state, CdnPool::Plgb, "LB_CDN_URLS").await;
-    seed_cdns_from_env(&state, CdnPool::Telethon, "LB_CDN_URLS_TELETHON").await;
+    // ── Load persisted CDNs from MongoDB, then seed from env vars (per pool) ──
+    if state.config.enable_plgb {
+        let loaded = load_persisted_cdns(&state, CdnPool::Plgb).await;
+        tracing::info!("Loaded {} CDN(s) from MongoDB cdn_registry", loaded);
+        seed_cdns_from_env(&state, CdnPool::Plgb, "LB_CDN_URLS").await;
+    }
+    if state.config.enable_telethon {
+        let loaded_telethon = load_persisted_cdns(&state, CdnPool::Telethon).await;
+        tracing::info!("Loaded {} CDN(s) from MongoDB cdn_registry_telethon", loaded_telethon);
+        seed_cdns_from_env(&state, CdnPool::Telethon, "LB_CDN_URLS_TELETHON").await;
+    }
 
     rebuild_trusted_hosts(&state).await;
 
@@ -2180,30 +2210,46 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or(true);
 
     if is_leader {
-        let s = state.clone();
-        tokio::spawn(poller_task(s, CdnPool::Plgb));
-        let s_telethon = state.clone();
-        tokio::spawn(poller_task(s_telethon, CdnPool::Telethon));
-        tracing::info!("CDN pollers started (plgb + telethon-plgb)");
+        if state.config.enable_plgb {
+            let s = state.clone();
+            tokio::spawn(poller_task(s, CdnPool::Plgb));
+        }
+        if state.config.enable_telethon {
+            let s_telethon = state.clone();
+            tokio::spawn(poller_task(s_telethon, CdnPool::Telethon));
+        }
+        tracing::info!(
+            "CDN pollers started (plgb={}, telethon-plgb={})",
+            state.config.enable_plgb,
+            state.config.enable_telethon
+        );
     } else {
         tracing::warn!("CDN pollers disabled (IS_LEADER=0)");
     }
 
     // ── Router ─────────────────────────────────────────────────
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/health", get(health))
         .route("/nitai", get(nitai))
-        .route("/add_cdn", post(add_cdn))
-        .route("/add_cdn_telethon", post(add_cdn_telethon))
         .route("/reload_special", post(reload_special))
-        .route("/dl/:hash/*filename", get(dl))
-        .route("/watch/:hash/*filename", get(watch))
-        .route("/t/dl/:payload/:sig", get(t_dl))
-        .route("/t/wt/:payload/:sig", get(t_wt))
         .route("/ad-tokens/:user_id/:rand", get(ad_tokens_entry))
         .route("/ad-tokens/:user_id/:rand/:token", get(ad_tokens_callback))
-        .route("/stats", get(stats))
-        .with_state(state);
+        .route("/stats", get(stats));
+
+    if state.config.enable_plgb {
+        app = app
+            .route("/add_cdn", post(add_cdn))
+            .route("/dl/:hash/*filename", get(dl))
+            .route("/watch/:hash/*filename", get(watch));
+    }
+    if state.config.enable_telethon {
+        app = app
+            .route("/add_cdn_telethon", post(add_cdn_telethon))
+            .route("/t/dl/:payload/:sig", get(t_dl))
+            .route("/t/wt/:payload/:sig", get(t_wt));
+    }
+
+    let app = app.with_state(state);
 
     axum::serve(
         listener,
