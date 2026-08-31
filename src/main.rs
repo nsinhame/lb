@@ -68,6 +68,8 @@ struct Config {
     admin_key: String,
     /// Secret used to HMAC-sign ad-callback tokens (falls back to admin_key).
     ad_secret: String,
+    /// Global master switch for showing ads (LB_SHOW_ADS; default on).
+    show_ads: bool,
     tg_redirect: String,
     max_requests_per_ip: usize,
     ttl_seconds: u64,
@@ -96,11 +98,18 @@ impl Config {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| admin_key.clone());
 
+        // Unset -> ads on; "0"/"false"/"no"/"off" -> ads globally disabled.
+        let show_ads = std::env::var("LB_SHOW_ADS")
+            .ok()
+            .map(|v| !matches!(v.trim().to_lowercase().as_str(), "0" | "false" | "no" | "off"))
+            .unwrap_or(true);
+
         Config {
             arolinks_api: std::env::var("AROLINKS_API_TOKEN").ok(),
             arolinks_endpoint: "https://arolinks.com/api".to_string(),
             admin_key,
             ad_secret,
+            show_ads,
             tg_redirect: std::env::var("REDIRECT_TO").unwrap_or_default(),
             max_requests_per_ip: std::env::var("LB_MAX_REQUESTS_PER_IP")
                 .ok()
@@ -1555,10 +1564,12 @@ async fn handle_link(
         return handle_special_redirect(&state, "one_ad").await;
     }
 
-    // 3. Per-user ad gate: show an ad if this file's owner hasn't watched one in
-    //    the last 2 days (or has no recorded ad_watch_time). Only meaningful when
-    //    arolinks is configured.
-    if state.config.arolinks_api.is_some() && should_show_ads(&state, &hash).await {
+    // 3. Per-user ad gate. Skipped when ads are globally disabled (LB_SHOW_ADS)
+    //    or arolinks is not configured.
+    if state.config.show_ads
+        && state.config.arolinks_api.is_some()
+        && should_show_ads(&state, &hash).await
+    {
         if let Some(resp) = ad_redirect(&state, &headers, kind, &hash, &filename).await {
             return resp;
         }
@@ -1679,6 +1690,15 @@ fn ad_token_invalid_page() -> Response {
     )
 }
 
+fn ad_token_ads_off_page() -> Response {
+    message_page(
+        "&#127881;",
+        "No ads right now",
+        "Ads are currently turned off - downloads and streams are ad-free for everyone. Enjoy!",
+        "#68d391",
+    )
+}
+
 /// Send the user through an arolinks ad whose destination is the signed callback
 /// that grants the tokens. Falls back to the callback directly if arolinks is
 /// unavailable, so the flow still completes.
@@ -1717,6 +1737,9 @@ async fn ad_tokens_entry(
     let Ok(user_id) = user_id_str.parse::<i64>() else {
         return ad_token_invalid_page();
     };
+    if !state.config.show_ads {
+        return ad_token_ads_off_page();
+    }
     let now = now_unix_f64();
     match user_ad_watch_time_by_id(&state, user_id).await {
         // Banked more than a day ahead already → no ad, just inform the user.
@@ -1834,6 +1857,9 @@ async fn main() -> anyhow::Result<()> {
     }
     if config.tg_redirect.is_empty() {
         anyhow::bail!("REDIRECT_TO env var is required but not set");
+    }
+    if !config.show_ads {
+        tracing::warn!("LB_SHOW_ADS is off - ads are globally disabled");
     }
     if config.arolinks_api.is_none() {
         tracing::warn!("AROLINKS_API_TOKEN not set – one_ad and two_ad will fall back to direct Telegram redirect");
