@@ -36,6 +36,8 @@ mongodb = "2"
 hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
+# base64url decoding of telethon-plgb's dl/wt payload tokens (ad-gating user_id extraction)
+base64 = "0.22"
 
 [profile.release]
 opt-level = 3
